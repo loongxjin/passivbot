@@ -3794,6 +3794,7 @@ class CandlestickManager:
         # to trigger gap filling via CCXT. This fixes warmup requests that span 31 days but
         # were skipping gap detection because end_ts == latest_finalized.
         historical = end_ts < end_finalized
+        large_span_forced_historical = False
         if (
             not historical
             and span_minutes > large_span_threshold
@@ -3808,11 +3809,26 @@ class CandlestickManager:
                 fully_covered=fully_covered,
             )
             historical = True
-        if self.exchange is not None and historical and not skip_historical_gap_fill:
+            large_span_forced_historical = True
+        # For large spans (>2 days) that are forced to historical mode, always fetch gaps
+        # even if skip_historical_gap_fill is set. This ensures exchanges without archive
+        # support (like OKX) can still get historical data for EMA calculation.
+        should_fetch_historical = historical and (
+            not skip_historical_gap_fill or large_span_forced_historical
+        )
+        if large_span_forced_historical and skip_historical_gap_fill:
+            self._log(
+                "info",
+                "large_span_ignoring_skip_historical",
+                symbol=symbol,
+                span_minutes=int(span_minutes),
+                message="Fetching historical data despite skip_historical_gap_fill due to large span",
+            )
+        if self.exchange is not None and should_fetch_historical:
             # If the requested historical window is not fully covered in memory,
             # attempt to fetch unknown missing spans, regardless of shard presence.
-            # Skip this if skip_historical_gap_fill is set (e.g., live warmup where
-            # we only need recent data and old gaps don't matter).
+            # Note: skip_historical_gap_fill is ignored for large spans (>2 days) to
+            # ensure EMA calculation has sufficient historical data on all exchanges.
             if not fully_covered:
                 # Hyperliquid special case: cap lookback to last 5000 minutes
                 try:
