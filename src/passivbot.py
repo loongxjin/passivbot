@@ -2516,10 +2516,23 @@ class Passivbot:
         allowance_pct = float(self.bp(pside, "risk_we_excess_allowance_pct", symbol))
         allowance_multiplier = 1.0 + max(0.0, allowance_pct)
         effective_limit = base_limit * allowance_multiplier
-        return (
-            self.balance * effective_limit * self.bp(pside, "entry_initial_qty_pct", symbol)
-            >= self.effective_min_cost[symbol]
-        )
+        min_entry_cost = self.balance * effective_limit * self.bp(pside, "entry_initial_qty_pct", symbol)
+        effective_min_cost = self.effective_min_cost.get(symbol, 0.0)
+        result = min_entry_cost >= effective_min_cost
+        # Debug logging for troubleshooting
+        if not hasattr(self, "_emc_debug_logged"):
+            self._emc_debug_logged = set()
+        debug_key = (symbol, pside)
+        if debug_key not in self._emc_debug_logged:
+            logging.info(
+                f"[debug] effective_min_cost check for {symbol} {pside}: "
+                f"balance={self.balance:.2f}, base_limit={base_limit:.4f}, "
+                f"entry_initial_qty_pct={self.bp(pside, 'entry_initial_qty_pct', symbol):.4f}, "
+                f"min_entry_cost={min_entry_cost:.2f}, effective_min_cost={effective_min_cost:.2f}, "
+                f"result={result}"
+            )
+            self._emc_debug_logged.add(debug_key)
+        return result
 
     def add_new_order(self, order, source="WS"):
         """No-op placeholder; subclasses update open orders through REST synchronisation."""

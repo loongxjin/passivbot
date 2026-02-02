@@ -601,14 +601,34 @@ def load_ccxt_instance(exchange_id: str, enable_rate_limit: bool = True, timeout
     The returned instance should be closed by the caller with: await cc.close()
     """
     ex = normalize_exchange_name(exchange_id)
-    try:
-        cc = getattr(ccxt, ex)(
-            {
-                "enableRateLimit": bool(enable_rate_limit),
-                # Default ccxt timeout can be too low for long lookbacks; raise to be tolerant.
-                "timeout": int(timeout_ms),
-            }
+    import os
+    import aiohttp
+    config = {
+        "enableRateLimit": bool(enable_rate_limit),
+        # Default ccxt timeout can be too low for long lookbacks; raise to be tolerant.
+        "timeout": int(timeout_ms),
+    }
+    # Auto-detect proxy from environment variables
+    http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+    proxy_url = https_proxy or http_proxy
+    if proxy_url:
+        # For async ccxt, create a session with explicit proxy support
+        # CCXT will use this session for all HTTP requests
+        connector = aiohttp.TCPConnector(ssl=False)
+        session = aiohttp.ClientSession(
+            connector=connector,
+            timeout=aiohttp.ClientTimeout(total=timeout_ms / 1000)
         )
+        # Monkey-patch session._request to inject proxy parameter
+        original_request = session._request
+        async def _patched_request(method, url, **kwargs):
+            kwargs['proxy'] = proxy_url
+            return await original_request(method, url, **kwargs)
+        session._request = _patched_request
+        config["session"] = session
+    try:
+        cc = getattr(ccxt, ex)(config)
     except Exception:
         raise RuntimeError(f"ccxt exchange '{ex}' not available")
     try:
