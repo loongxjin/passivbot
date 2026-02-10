@@ -2887,6 +2887,12 @@ class CandlestickManager:
                     timeout=timeout,
                     connector=connector,
                 )
+                # Auto-detect proxy from environment variables
+                http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+                https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                self._http_proxy = https_proxy or http_proxy
+                if self._http_proxy:
+                    self._log("debug", "archive_http_proxy_detected", proxy=self._http_proxy)
             return self._http_session
 
     async def _close_http_session(self) -> None:
@@ -2910,7 +2916,9 @@ class CandlestickManager:
 
         session = await self._get_http_session()
         try:
-            async with session.get(url) as resp:
+            # Use proxy if detected from environment variables
+            proxy = getattr(self, '_http_proxy', None)
+            async with session.get(url, proxy=proxy) as resp:
                 if resp.status == 404:
                     self._emit_remote_fetch(
                         {
