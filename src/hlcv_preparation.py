@@ -2,14 +2,13 @@ import asyncio
 import json
 import logging
 import os
-import pprint
 import sys
 import time
 import traceback
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from uuid import uuid4
 
 import numpy as np
@@ -66,17 +65,17 @@ class ProgressTracker:
 
 
 from config_utils import require_config_value, require_live_value
-from ohlcv_utils import dump_ohlcv_data
+from ohlcv_utils import dump_ohlcv_data, get_days_in_between, load_ohlcv_data
 from procedures import get_first_timestamps_unified
 from utils import (
     coin_to_symbol,
-    denormalize_exchange_name,
+    to_standard_exchange_name,
     format_end_date,
     get_quote,
     load_ccxt_instance,
     load_markets,
     make_get_filepath,
-    normalize_exchange_name,
+    to_ccxt_exchange_id,
     symbol_to_coin,
     ts_to_date,
     utc_ms,
@@ -99,16 +98,17 @@ class HLCVManager:
         cm_debug_level: int = 0,
         cm_progress_log_interval_seconds: float = 10.0,  # Log progress every 10s by default
         force_refetch_gaps: bool = False,
+        ohlcv_source_dir: Optional[str] = None,
     ):
-        self.exchange = normalize_exchange_name(exchange)
+        self.exchange = to_ccxt_exchange_id(exchange)
         self.quote = get_quote(self.exchange)
         self.start_date = "2020-01-01" if start_date is None else format_end_date(start_date)
         self.end_date = format_end_date("now" if end_date is None else end_date)
         self.start_ts = int(date_to_ts(self.start_date))
         self.end_ts = int(date_to_ts(self.end_date))
         self.cc = cc
-        # Use denormalized exchange name for cache paths (e.g., "binance" not "binanceusdm")
-        cache_exchange = denormalize_exchange_name(self.exchange)
+        # Use standard exchange name for cache paths (e.g., "binance" not "binanceusdm")
+        cache_exchange = to_standard_exchange_name(self.exchange)
         self.cache_filepaths = {
             "markets": os.path.join("caches", cache_exchange, "markets.json"),
             "first_timestamps": os.path.join("caches", cache_exchange, "first_timestamps.json"),
@@ -123,6 +123,7 @@ class HLCVManager:
             self.cm_progress_log_interval_seconds = 0.0
         self.force_refetch_gaps = bool(force_refetch_gaps)
         self.cm: Optional[CandlestickManager] = None
+        self.ohlcv_source_dir = str(ohlcv_source_dir) if ohlcv_source_dir else None
 
     def update_date_range(self, new_start_date=None, new_end_date=None):
         if new_start_date is not None:
@@ -150,9 +151,10 @@ class HLCVManager:
             # Limit concurrent ccxt requests per exchange to reduce timeouts under heavy parallelism.
             # Bybit tends to be more sensitive.
             max_concurrent_requests = 3 if self.exchange == "bybit" else 5
+            # Use standard name for cache paths (e.g., "binance" not "binanceusdm")
             self.cm = CandlestickManager(
                 exchange=self.cc,
-                exchange_name=self.exchange,
+                exchange_name=to_standard_exchange_name(self.exchange),
                 debug=int(self.cm_debug_level),
                 progress_log_interval_seconds=float(self.cm_progress_log_interval_seconds),
                 max_concurrent_requests=max_concurrent_requests,
@@ -321,7 +323,8 @@ class HLCVManager:
 
     def has_coin(self, coin: str) -> bool:
         symbol = self.get_symbol(coin)
-        return bool(symbol)
+        # Also verify symbol exists in markets (fallback symbols won't be present)
+        return symbol and symbol in self.markets
 
     def get_market_specific_settings(self, coin: str) -> dict:
         mss = dict(self.markets[self.get_symbol(coin)])
@@ -402,6 +405,95 @@ class HLCVManager:
         self.dump_first_timestamp(coin, fts)
         return float(fts)
 
+    def _try_load_ohlcvs_from_source_dir(
+        self, coin: str, symbol: str, start_ts: int, end_ts: int
+    ) -> Optional[pd.DataFrame]:
+        if not self.ohlcv_source_dir:
+            return None
+        source_root = Path(self.ohlcv_source_dir)
+        if not source_root.exists():
+            return None
+
+        exchange_dir = to_standard_exchange_name(self.exchange)
+        exchange_root = source_root / exchange_dir / "1m"
+
+        start_day = ts_to_date(start_ts)
+        end_day = ts_to_date(end_ts)
+        days = get_days_in_between(start_day, end_day)
+
+        frames = []
+        candidates: list[str] = []
+        
+        # Mirror CandlestickManager's symbol sanitization for Windows compatibility
+        windows_compat = os.name == "nt" or os.getenv("WINDOWS_COMPATIBILITY") == "1"
+        
+        for name in (coin, symbol):
+            if not name:
+                continue
+            # Original name
+            candidates.append(name)
+            # Variant with "/" replaced by "_"
+            if "/" in name:
+                candidates.append(name.replace("/", "_"))
+            # In Windows compatibility mode, also mirror CandlestickManager's ":" -> "_"
+            if windows_compat and ("/" in name or ":" in name):
+                candidates.append(name.replace("/", "_").replace(":", "_"))
+        
+        # De-duplicate while preserving order
+        seen = set()
+        candidates = [c for c in candidates if not (c in seen or seen.add(c))]
+        for day in days:
+            loaded = False
+            for name in candidates:
+                base_dir = exchange_root / name
+                if not base_dir.exists():
+                    continue
+                for ext in (".npz", ".npy"):
+                    filepath = base_dir / f"{day}{ext}"
+                    if not filepath.exists():
+                        continue
+                    try:
+                        df = load_ohlcv_data(str(filepath))
+                    except Exception as exc:
+                        logging.warning(
+                            "[%s] source dir load failed for %s %s: %s",
+                            self.exchange,
+                            coin,
+                            filepath,
+                            exc,
+                        )
+                        continue
+                    if not df.empty:
+                        frames.append(df)
+                        loaded = True
+                        break
+                if loaded:
+                    break
+
+        if not frames:
+            return None
+
+        df = pd.concat(frames, ignore_index=True)
+        df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+        df = df[(df["timestamp"] >= start_ts) & (df["timestamp"] <= end_ts)]
+        if df.empty:
+            return None
+
+        ts = df["timestamp"].astype(np.int64, copy=False).values
+        if ts.size > 1:
+            intervals = np.diff(ts)
+            if not np.all(intervals == 60_000):
+                greatest_gap_ms = int(intervals.max(initial=60_000))
+                logging.warning(
+                    "[%s] source dir non-contiguous data for %s; greatest gap %.1f minutes. Falling back.",
+                    self.exchange,
+                    coin,
+                    greatest_gap_ms / 60_000.0,
+                )
+                return None
+
+        return df.reset_index(drop=True)
+
     async def get_ohlcvs(self, coin: str, start_date=None, end_date=None) -> pd.DataFrame:
         empty_df = pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
         if start_date is not None or end_date is not None:
@@ -409,14 +501,37 @@ class HLCVManager:
         if not self.markets:
             await self.load_markets()
         if not self.has_coin(coin):
+            logging.debug("[%s] get_ohlcvs: coin %s not found in markets", self.exchange, coin)
             return empty_df
-        self.load_cc()
-        assert self.cm is not None
         symbol = self.get_symbol(coin)
         start_ts = int(self.start_ts)
         end_ts = int(self.end_ts)
         if start_ts > end_ts:
+            logging.debug(
+                "[%s] get_ohlcvs: invalid range start_ts=%s > end_ts=%s",
+                self.exchange,
+                start_ts,
+                end_ts,
+            )
             return empty_df
+
+        if self.ohlcv_source_dir:
+            df = self._try_load_ohlcvs_from_source_dir(coin, symbol, start_ts, end_ts)
+            if df is not None and not df.empty:
+                logging.info(
+                    "[%s] get_ohlcvs: using source dir for %s",
+                    self.exchange,
+                    coin,
+                )
+                return df
+            logging.debug(
+                "[%s] get_ohlcvs: source dir had no data for %s; falling back to candlestick manager",
+                self.exchange,
+                coin,
+            )
+
+        self.load_cc()
+        assert self.cm is not None
 
         # Fetch strict (real) candles first to detect large gaps.
         real = await self.cm.get_candles(
@@ -429,6 +544,13 @@ class HLCVManager:
             force_refetch_gaps=self.force_refetch_gaps,
         )
         if real.size == 0:
+            logging.warning(
+                "[%s] get_ohlcvs: cm.get_candles returned empty for %s range %s to %s",
+                self.exchange,
+                symbol,
+                ts_to_date(start_ts),
+                ts_to_date(end_ts),
+            )
             return empty_df
 
         ts = real["ts"].astype(np.int64, copy=False)
@@ -520,7 +642,8 @@ async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool
         set(symbol_to_coin(c) for c in approved["long"])
         | set(symbol_to_coin(c) for c in approved["short"])
     )
-    exchange = normalize_exchange_name(exchange)
+    orig_coins = list(coins)
+    exchange = to_ccxt_exchange_id(exchange)
     requested_start_date = require_config_value(config, "backtest.start_date")
     requested_start_ts = int(date_to_ts(requested_start_date))
     end_date = format_end_date(require_config_value(config, "backtest.end_date"))
@@ -551,6 +674,7 @@ async def prepare_hlcvs(config: dict, exchange: str, *, force_refetch_gaps: bool
             config.get("backtest", {}).get("cm_progress_log_interval_seconds", 10.0) or 10.0
         ),
         force_refetch_gaps=force_refetch_gaps,
+        ohlcv_source_dir=config.get("backtest", {}).get("ohlcv_source_dir"),
     )
 
     try:
@@ -746,6 +870,13 @@ async def prepare_hlcvs_internal(
     progress.log_done()
 
     if not valid_coins:
+        logging.error(
+            "[%s] no valid coins found with data for %s -> %s (coins=%s)",
+            exchange,
+            ts_to_date(effective_start_ts),
+            ts_to_date(end_ts),
+            ",".join(coins),
+        )
         raise ValueError("No valid coins found with data")
 
     n_timesteps = int((global_end_time - global_start_time) / interval_ms) + 1
@@ -796,15 +927,30 @@ async def prepare_hlcvs_internal(
     return mss, timestamps, unified_array
 
 
-async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_gaps: bool = False):
+async def prepare_hlcvs_combined(
+    config,
+    forced_sources=None,
+    market_settings_sources=None,
+    *,
+    force_refetch_gaps: bool = False,
+):
     backtest_exchanges = require_config_value(config, "backtest.exchanges")
-    exchanges_to_consider = [normalize_exchange_name(e) for e in backtest_exchanges]
+    exchanges_to_consider = [to_ccxt_exchange_id(e) for e in backtest_exchanges]
     forced_sources = forced_sources or {}
     normalized_forced_sources = {
-        str(coin): normalize_exchange_name(exchange)
+        str(coin): to_ccxt_exchange_id(exchange)
         for coin, exchange in forced_sources.items()
         if exchange
     }
+    market_settings_sources = market_settings_sources or {}
+    normalized_mss_sources = {
+        str(coin): to_ccxt_exchange_id(exchange)
+        for coin, exchange in market_settings_sources.items()
+        if exchange
+    }
+    ohlcv_exchanges = sorted(
+        set(exchanges_to_consider) | set(normalized_forced_sources.values())
+    )
 
     requested_start_date = require_config_value(config, "backtest.start_date")
     requested_start_ts = int(date_to_ts(requested_start_date))
@@ -838,9 +984,11 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
                 config.get("backtest", {}).get("cm_progress_log_interval_seconds", 10.0) or 10.0
             ),
             force_refetch_gaps=force_refetch_gaps,
+            ohlcv_source_dir=config.get("backtest", {}).get("ohlcv_source_dir"),
         )
     extra_forced = set(normalized_forced_sources.values()) - set(exchanges_to_consider)
-    for ex in extra_forced:
+    extra_mss = set(normalized_mss_sources.values()) - set(exchanges_to_consider) - extra_forced
+    for ex in extra_forced | extra_mss:
         om_dict[ex] = HLCVManager(
             ex,
             effective_start_date,
@@ -853,6 +1001,7 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
                 config.get("backtest", {}).get("cm_progress_log_interval_seconds", 10.0) or 10.0
             ),
             force_refetch_gaps=force_refetch_gaps,
+            ohlcv_source_dir=config.get("backtest", {}).get("ohlcv_source_dir"),
         )
     btc_om: Optional[HLCVManager] = None
 
@@ -864,6 +1013,8 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
             requested_start_ts,
             end_ts,
             normalized_forced_sources,
+            normalized_mss_sources,
+            ohlcv_exchanges=ohlcv_exchanges,
         )
 
         btc_exchange = exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
@@ -877,8 +1028,20 @@ async def prepare_hlcvs_combined(config, forced_sources=None, *, force_refetch_g
         )
         # Align BTC date range to actual timestamps (mirrors single-exchange case)
         btc_om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
+        logging.info(
+            "fetching BTC/USD prices from %s for range %s to %s",
+            btc_exchange,
+            ts_to_date(int(timestamps[0])),
+            ts_to_date(int(timestamps[-1])),
+        )
         btc_df = await btc_om.get_ohlcvs("BTC")
         if btc_df.empty:
+            logging.error(
+                "BTC/USD fetch returned empty for %s (start=%s end=%s)",
+                btc_exchange,
+                btc_om.start_date,
+                btc_om.end_date,
+            )
             raise ValueError(f"Failed to fetch BTC/USD prices from {btc_exchange}")
 
         btc_df = (
@@ -919,13 +1082,21 @@ async def _prepare_hlcvs_combined_impl(
     _requested_start_ts: int,
     end_ts: int,
     forced_sources: Dict[str, str],
+    market_settings_sources: Optional[Dict[str, str]] = None,
+    *,
+    ohlcv_exchanges: Optional[Sequence[str]] = None,
 ):
+    market_settings_sources = market_settings_sources or {}
     approved = require_live_value(config, "approved_coins")
     coins = sorted(
         set(symbol_to_coin(c) for c in approved["long"])
         | set(symbol_to_coin(c) for c in approved["short"])
     )
-    exchanges_to_consider = sorted(list(om_dict.keys()))
+    orig_coins = list(coins)
+    if ohlcv_exchanges is not None:
+        exchanges_to_consider = [ex for ex in ohlcv_exchanges if ex in om_dict]
+    else:
+        exchanges_to_consider = sorted(list(om_dict.keys()))
     minimum_coin_age_days = float(require_live_value(config, "minimum_coin_age_days"))
     interval_ms = 60_000
     min_coin_age_ms = 1000 * 60 * 60 * 24 * minimum_coin_age_days
@@ -940,6 +1111,45 @@ async def _prepare_hlcvs_combined_impl(
 
     # Preload markets
     await asyncio.gather(*[om.load_markets() for om in om_dict.values()])
+
+    # Normalize stock perp coins: convert plain tickers to xyz: prefixed for hyperliquid
+    def normalize_stock_perp_coin(coin: str, forced_exchange: Optional[str]) -> str:
+        """Convert plain ticker to xyz: prefix if it's a stock perp on hyperliquid."""
+        if forced_exchange != "hyperliquid":
+            return coin
+        if coin.startswith("xyz:"):
+            return coin  # Already prefixed
+        # Check if xyz:TICKER exists on hyperliquid
+        hl_om = om_dict.get("hyperliquid")
+        if hl_om and hl_om.markets:
+            xyz_coin = f"xyz:{coin}"
+            # Check if the xyz: prefixed version maps to a valid symbol
+            xyz_symbol = coin_to_symbol(xyz_coin, "hyperliquid")
+            if xyz_symbol and xyz_symbol in hl_om.markets:
+                logging.info(f"Normalizing stock perp coin: {coin} -> {xyz_coin}")
+                return xyz_coin
+        return coin
+
+    # Apply normalization to coins
+    orig_coins = list(coins)
+    normalized_coins = []
+    for coin in coins:
+        # Get the forced exchange for this coin (checking both with and without xyz: prefix)
+        forced_ex = forced_sources.get(coin)
+        if forced_ex is None and coin.startswith("xyz:"):
+            forced_ex = forced_sources.get(coin[4:])  # Check without prefix
+        elif forced_ex is None and not coin.startswith("xyz:"):
+            forced_ex = forced_sources.get(f"xyz:{coin}")  # Check with prefix
+        normalized_coin = normalize_stock_perp_coin(coin, forced_ex)
+        normalized_coins.append(normalized_coin)
+
+    # Deduplicate and update coins list
+    coins = sorted(set(normalized_coins))
+
+    # Update first_timestamps for normalized coins
+    for orig, norm in zip(orig_coins, normalized_coins):
+        if orig != norm and orig in first_timestamps_unified and norm not in first_timestamps_unified:
+            first_timestamps_unified[norm] = first_timestamps_unified[orig]
 
     progress = ProgressTracker(len(coins), "combined fetching candles")
     progress.maybe_log(force=True)
@@ -975,7 +1185,11 @@ async def _prepare_hlcvs_combined_impl(
                         int(minimum_coin_age_days),
                     )
 
+                # Try matching coin directly, then try base coin without xyz: prefix
                 forced_exchange = forced_sources.get(coin)
+                if forced_exchange is None and coin.startswith("xyz:"):
+                    base_coin = coin[4:]  # Remove "xyz:" prefix
+                    forced_exchange = forced_sources.get(base_coin)
                 candidate_exchanges = [forced_exchange] if forced_exchange else exchanges_to_consider
                 for ex in candidate_exchanges:
                     if ex not in om_dict:
@@ -1031,9 +1245,34 @@ async def _prepare_hlcvs_combined_impl(
 
                 logging.info(f"{coin} exchange preference: {[x[0] for x in exchange_candidates]}")
 
-                # Prepare market settings
-                mss = om_dict[best_exchange].get_market_specific_settings(coin)
-                mss["exchange"] = denormalize_exchange_name(best_exchange)
+                # Determine market settings source (may differ from OHLCV source)
+                settings_exchange = market_settings_sources.get(coin, best_exchange)
+                if settings_exchange != best_exchange:
+                    settings_om = om_dict.get(settings_exchange)
+                    if settings_om is None:
+                        logging.warning(
+                            f"{coin}: market_settings_sources exchange '{settings_exchange}' "
+                            f"not available, falling back to OHLCV source '{best_exchange}'"
+                        )
+                        settings_exchange = best_exchange
+                    else:
+                        try:
+                            settings_om.get_symbol(coin)
+                        except Exception:
+                            logging.warning(
+                                f"{coin}: not listed on market_settings_sources exchange "
+                                f"'{settings_exchange}', falling back to OHLCV source '{best_exchange}'"
+                            )
+                            settings_exchange = best_exchange
+
+                # Prepare market settings from (possibly overridden) exchange
+                mss = om_dict[settings_exchange].get_market_specific_settings(coin)
+                mss["exchange"] = to_standard_exchange_name(settings_exchange)
+                if settings_exchange != best_exchange:
+                    mss["ohlcv_source"] = to_standard_exchange_name(best_exchange)
+                    logging.info(
+                        f"{coin}: OHLCV from {best_exchange}, market settings from {settings_exchange}"
+                    )
                 warm_minutes = int(per_coin_warmups.get(coin, default_warm))
                 mss["warmup_minutes"] = warm_minutes
 
@@ -1083,18 +1322,24 @@ async def _prepare_hlcvs_combined_impl(
     )
     end_date_for_volume_ratios = ts_to_date(global_end_time)
 
-    exchanges_with_data = sorted(set([chosen_mss_per_coin[coin]["exchange"] for coin in valid_coins]))
+    # Use OHLCV sources for volume ratio calculation, not market settings sources
+    exchanges_with_data = sorted(set([
+        chosen_mss_per_coin[coin].get("ohlcv_source", chosen_mss_per_coin[coin]["exchange"]) 
+        for coin in valid_coins
+    ]))
     exchange_volume_ratios = await compute_exchange_volume_ratios(
         exchanges_with_data,
         valid_coins,
         start_date_for_volume_ratios,
         end_date_for_volume_ratios,
-        # om_dict keys are normalized (e.g. "binanceusdm"), but exchanges_with_data are denormalized
-        {ex: om_dict[normalize_exchange_name(ex)] for ex in exchanges_with_data},
+        # om_dict keys are ccxt IDs (e.g. "binanceusdm"), but exchanges_with_data use standard names
+        {ex: om_dict[to_ccxt_exchange_id(ex)] for ex in exchanges_with_data},
     )
     exchanges_counts = defaultdict(int)
     for coin in chosen_mss_per_coin:
-        exchanges_counts[chosen_mss_per_coin[coin]["exchange"]] += 1
+        # Use OHLCV source for volume normalization, not market settings source
+        ohlcv_exchange = chosen_mss_per_coin[coin].get("ohlcv_source", chosen_mss_per_coin[coin]["exchange"])
+        exchanges_counts[ohlcv_exchange] += 1
     reference_exchange = sorted(exchanges_counts.items(), key=lambda x: x[1])[-1][0]
     exchange_volume_ratios_mapped = defaultdict(dict)
     if len(exchanges_counts) == 1:
@@ -1106,14 +1351,43 @@ async def _prepare_hlcvs_combined_impl(
             exchange_volume_ratios_mapped[ex1][ex1] = 1.0
             exchange_volume_ratios_mapped[ex0][ex0] = 1.0
 
-    pprint.pprint(dict(exchange_volume_ratios_mapped))
+    # Log volume normalization ratios (used to scale volumes when combining multi-exchange data)
+    if len(exchanges_counts) > 1:
+        ratio_summary = ", ".join(
+            f"{ex}={exchange_volume_ratios_mapped[ex][reference_exchange]:.3f}"
+            for ex in sorted(exchanges_counts.keys())
+            if ex != reference_exchange and ex in exchange_volume_ratios_mapped
+        )
+        logging.info(
+            "volume normalization: reference=%s ratios=[%s] (coins per exchange: %s)",
+            reference_exchange,
+            ratio_summary,
+            ", ".join(f"{ex}={cnt}" for ex, cnt in sorted(exchanges_counts.items())),
+        )
+
+    # Log exchange assignment summary (which exchange was chosen for which coins)
+    if len(exchanges_counts) > 1:
+        coins_by_exchange = defaultdict(list)
+        for coin in valid_coins:
+            # Use OHLCV source for grouping, not market settings source
+            ohlcv_ex = chosen_mss_per_coin[coin].get("ohlcv_source", chosen_mss_per_coin[coin]["exchange"])
+            coins_by_exchange[ohlcv_ex].append(symbol_to_coin(coin))
+        for ex in sorted(coins_by_exchange.keys()):
+            coins_list = coins_by_exchange[ex]
+            logging.info(
+                "[combined] chose %s for %d coins: %s",
+                ex,
+                len(coins_list),
+                ", ".join(sorted(coins_list)),
+            )
 
     unified_array = np.full((n_timesteps, n_coins, 4), np.nan, dtype=np.float64)
 
     for i, coin in enumerate(valid_coins):
         df = chosen_data_per_coin[coin].copy()
         df = df.set_index("timestamp").reindex(timestamps)
-        exchange_for_this_coin = chosen_mss_per_coin[coin]["exchange"]
+        # Use OHLCV source for volume normalization, not market settings source
+        exchange_for_this_coin = chosen_mss_per_coin[coin].get("ohlcv_source", chosen_mss_per_coin[coin]["exchange"])
         scaling_factor = exchange_volume_ratios_mapped[exchange_for_this_coin][reference_exchange]
         df["volume"] *= scaling_factor
 
@@ -1148,6 +1422,16 @@ async def fetch_data_for_coin_and_exchange(
     t0 = time.monotonic()
     # Calculate approximate number of days for better visibility
     days_approx = max(1, (end_ts - effective_start_ts) // (24 * 60 * 60 * 1000))
+
+    # Stock perps (xyz:*) are only available on Hyperliquid
+    if coin.startswith("xyz:") and ex != "hyperliquid":
+        logging.debug(
+            "%s candles fetch skip coin=%s reason=stock_perp_only_on_hyperliquid",
+            ex,
+            coin,
+        )
+        return None
+
     logging.info(
         "%s candles fetch start coin=%s range=%s..%s (~%d days)",
         ex,

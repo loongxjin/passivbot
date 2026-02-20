@@ -171,6 +171,7 @@ pub struct BacktestParams {
     pub metrics_only: bool,
     pub filter_by_min_effective_cost: bool,
     pub hedge_mode: bool,
+    pub candle_interval_minutes: u64, // 1 for 1m candles (default), 5 for 5m, etc.
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
@@ -480,6 +481,10 @@ pub struct Analysis {
     pub total_wallet_exposure_max: f64,
     pub total_wallet_exposure_mean: f64,
     pub total_wallet_exposure_median: f64,
+    pub high_exposure_hours_mean_long: f64,
+    pub high_exposure_hours_max_long: f64,
+    pub high_exposure_hours_mean_short: f64,
+    pub high_exposure_hours_max_short: f64,
     pub entry_initial_balance_pct_long: f64,
     pub entry_initial_balance_pct_short: f64,
 }
@@ -538,6 +543,10 @@ impl Default for Analysis {
             total_wallet_exposure_max: 0.0,
             total_wallet_exposure_mean: 0.0,
             total_wallet_exposure_median: 0.0,
+            high_exposure_hours_mean_long: 0.0,
+            high_exposure_hours_max_long: 0.0,
+            high_exposure_hours_mean_short: 0.0,
+            high_exposure_hours_max_short: 0.0,
             entry_initial_balance_pct_long: 0.0,
             entry_initial_balance_pct_short: 0.0,
         }
