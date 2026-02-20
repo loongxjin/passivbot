@@ -384,3 +384,6 @@ Cargo.lock
 
 # Git worktrees
 .worktrees/
+
+
+.lh
