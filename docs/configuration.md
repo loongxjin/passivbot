@@ -17,6 +17,9 @@ This document provides an overview of the parameters found in `config/template.j
 - **filter_by_min_effective_cost**: When `true`, skip coins whose projected initial entry
   (balance × wallet_exposure_limit × entry_initial_qty_pct, including WE excess allowance)
   would fall below the exchange’s effective minimum cost.
+- **dynamic_wel_by_tradability**: Backtest-only WEL denominator mode.  
+  - `true` (default): `wallet_exposure_limit = total_wallet_exposure_limit / min(n_positions, n_tradable_max)` where `n_tradable_max` is the highest number of coins that have had real candles at any timestep so far (non-shrinking).  
+  - `false`: fixed denominator, same as live: `wallet_exposure_limit = total_wallet_exposure_limit / n_positions`.
 - **maker_fee_override**: Optional maker fee override (part-per-one; use `0.0002` for 0.02%). Leave `null` to use the exchange-derived maker fees.
 - **balance_sample_divider**: Minutes per bucket when sampling balances/equity for
   `balance_and_equity.csv` and related plots. `1` keeps full per-minute resolution; higher values
@@ -78,7 +81,8 @@ Example per-metric aggregation:
 - **total_wallet_exposure_limit**: Maximum exposure allowed.
   - Example: `total_wallet_exposure_limit = 0.75` means 75% of (unleveraged) wallet balance is used.
   - Example: `total_wallet_exposure_limit = 1.6` means 160% of (unleveraged) wallet balance is used.
-  - Each position is given an equal share: `wallet_exposure_limit = total_wallet_exposure_limit / n_positions`.
+  - Live denominator is fixed: `wallet_exposure_limit = total_wallet_exposure_limit / n_positions`.
+  - Backtest denominator is controlled by `backtest.dynamic_wel_by_tradability`.
   - See more: `docs/risk_management.md`.
 - **enforce_exposure_limit**: If `true`, enforces exposure limits for each position.
   - Example: If a position's exposure exceeds 1% of the limit, reduce the position at market price to the exposure limit.
@@ -277,6 +281,10 @@ Coins selected for trading are filtered by volume and log range. First, filter c
 - **risk_wel_enforcer_threshold**: Per-symbol multiplier that triggers the WEL enforcer. When a position’s exposure exceeds `wallet_exposure_limit * (1 + risk_we_excess_allowance_pct) * risk_wel_enforcer_threshold` the bot emits a reduce-only order to bring it back under control. Set <1.0 for continual trimming, `1.0` for a hard cap, or ≤0 to disable.
 - **risk_twel_enforcer_threshold**: Fraction of the configured `total_wallet_exposure_limit` that triggers the TWEL enforcer. When aggregate exposure exceeds this threshold the bot queues reduction orders instead of new entries. Set >1.0 to allow a grace margin, `1.0` for strict enforcement, or ≤0 to disable.
 - **risk_we_excess_allowance_pct**: Per-symbol allowance above the configured wallet exposure limit that the enforcer tolerates before trimming. Useful for smoothing reductions; leave at `0.0` for a hard cap.
+- **max_realized_loss_pct**: Global realized-loss gate for close orders, anchored to peak realized balance from fill history. For each close order, if projected realized PnL would push balance below `peak_balance * (1 - max_realized_loss_pct)`, the order is blocked. Applies to all close order types (including WEL/TWEL auto-reduce and unstuck) except panic closes.
+  - `<= 0.0`: block all lossy closes.
+  - `>= 1.0`: disable the gate.
+  - Example: with peak balance `$10,000` and `max_realized_loss_pct = 0.05`, lossy closes are blocked once projected balance would fall below `$9,500`.
 - **max_warmup_minutes**: Hard ceiling applied to the historical warm-up window for both backtests and live warm-ups. Use `0` to disable the cap; otherwise values above `0` clamp the per-symbol warmup calculated from EMA spans.
 - **warmup_ratio**: Multiplier applied to the longest EMA or log-range span (in minutes) across long/short settings to decide how much 1m history to prefetch before trading. A value of `0.2`, for example, warmups ~20% of the deepest lookback, capped by `max_warmup_minutes`.
 - **warmup_minutes**: Per-coin warm-up window (in minutes) derived from `warmup_ratio`, indicator spans, and the optional `max_warmup_minutes` ceiling. This value is used by the backtester and CandlestickManager to skip the earliest candles until indicators are fully primed; adjust `warmup_ratio` or the spans themselves to change it.

@@ -21,7 +21,6 @@ from custom_endpoint_overrides import (
 )
 from config_transform import record_transform
 
-
 logging.basicConfig(
     format="%(asctime)s %(levelname)-8s %(message)s",
     level=logging.INFO,
@@ -1393,3 +1392,37 @@ async def get_first_ohlcv_iteratively(cc, symbol):
         return daily_chunk[0]
 
     return best_candle
+
+
+def deep_get(d, key_path, *args):
+    """
+    Retrieves a value from a nested dict using dot notation.
+    Handles keys that may contain dots via greedy matching.
+    """
+    # Check if a default was provided via *args
+    has_default = len(args) > 0
+    default = args[0] if has_default else None
+
+    segments = key_path.split(".")
+    current = d
+
+    i = 0
+    while i < len(segments):
+        found = False
+
+        # Greedy look-ahead: try to find the longest matching key
+        for j in range(i + 1, len(segments) + 1):
+            candidate_key = ".".join(segments[i:j])
+
+            if isinstance(current, dict) and candidate_key in current:
+                current = current[candidate_key]
+                i = j  # Jump the pointer forward
+                found = True
+                break
+
+        if not found:
+            if has_default:
+                return default
+            raise KeyError(f"Path segment '{segments[i]}' not found in '{key_path}'")
+
+    return current

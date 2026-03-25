@@ -67,7 +67,9 @@ from legacy_data_migrator import (
 )
 
 # Suppress portalocker's "timeout has no effect in blocking mode" warning
-warnings.filterwarnings("ignore", message="timeout has no effect in blocking mode", module="portalocker")
+warnings.filterwarnings(
+    "ignore", message="timeout has no effect in blocking mode", module="portalocker"
+)
 
 # ----- Constants and dtypes -----
 
@@ -268,7 +270,9 @@ def _quarantine_gateio_cache_if_stale(cache_base: str, cutoff_date: str) -> None
     try:
         cutoff = datetime.strptime(cutoff_date, "%Y-%m-%d").date()
     except Exception:
-        logging.warning("Invalid GATEIO_CACHE_CUTOFF_DATE=%r; skipping gateio cache check", cutoff_date)
+        logging.warning(
+            "Invalid GATEIO_CACHE_CUTOFF_DATE=%r; skipping gateio cache check", cutoff_date
+        )
         return
 
     gateio_root = os.path.join(cache_base, "gateio")
@@ -1891,9 +1895,7 @@ class CandlestickManager:
             count = len(replaced)
             if self._candle_replace_batch_mode:
                 # Batch mode: collect for aggregated summary later
-                self._candle_replace_batch[symbol] = (
-                    self._candle_replace_batch.get(symbol, 0) + count
-                )
+                self._candle_replace_batch[symbol] = self._candle_replace_batch.get(symbol, 0) + count
             else:
                 # Normal operation: log at DEBUG (individual messages are noisy)
                 self.log.debug(
@@ -2909,6 +2911,11 @@ class CandlestickManager:
                 )
                 if getattr(self, "_net_sem", None) is not None:
                     async with self._net_sem:  # type: ignore[attr-defined]
+                        # Re-check rate limit after acquiring semaphore.
+                        # Tasks may have been queued before a 429 set the
+                        # global backoff; honour it now instead of firing
+                        # immediately after the semaphore unblocks.
+                        await self._apply_rate_limit_backoff()
                         res = await ex.fetch_ohlcv(
                             symbol,
                             timeframe=tf_norm,
@@ -3867,13 +3874,28 @@ class CandlestickManager:
                 df = table.to_pandas()
 
                 # Rename columns to match expected format
-                col_map = {"ts": "timestamp", "o": "open", "h": "high", "l": "low", "c": "close", "bv": "volume"}
+                col_map = {
+                    "ts": "timestamp",
+                    "o": "open",
+                    "h": "high",
+                    "l": "low",
+                    "c": "close",
+                    "bv": "volume",
+                }
                 df = df.rename(columns=col_map)
 
-                self._log("debug", "hyperliquid_archive_hit", symbol=symbol, day_key=day_key, path=str(cache_path))
+                self._log(
+                    "debug",
+                    "hyperliquid_archive_hit",
+                    symbol=symbol,
+                    day_key=day_key,
+                    path=str(cache_path),
+                )
                 return self._ohlcv_df_to_day_arr(df, day_key)
             except Exception as e:
-                self._log("debug", "hyperliquid_archive_error", symbol=symbol, day_key=day_key, error=str(e))
+                self._log(
+                    "debug", "hyperliquid_archive_error", symbol=symbol, day_key=day_key, error=str(e)
+                )
 
         # 2. For stock perps, try TradFi data fetch
         try:
@@ -3944,14 +3966,16 @@ class CandlestickManager:
                 # Convert to day array format
                 import pandas as pd
 
-                df = pd.DataFrame({
-                    "timestamp": arr["ts"],
-                    "open": arr["o"],
-                    "high": arr["h"],
-                    "low": arr["l"],
-                    "close": arr["c"],
-                    "volume": arr["bv"],
-                })
+                df = pd.DataFrame(
+                    {
+                        "timestamp": arr["ts"],
+                        "open": arr["o"],
+                        "high": arr["h"],
+                        "low": arr["l"],
+                        "close": arr["c"],
+                        "volume": arr["bv"],
+                    }
+                )
                 return self._ohlcv_df_to_day_arr(df, day_key)
 
         except Exception as e:
@@ -3983,14 +4007,16 @@ class CandlestickManager:
 
             cache_path.parent.mkdir(parents=True, exist_ok=True)
 
-            table = pa.table({
-                "ts": pa.array(arr["ts"].astype("int64")),
-                "o": pa.array(arr["o"].astype("float32")),
-                "h": pa.array(arr["h"].astype("float32")),
-                "l": pa.array(arr["l"].astype("float32")),
-                "c": pa.array(arr["c"].astype("float32")),
-                "bv": pa.array(arr["bv"].astype("float32")),
-            })
+            table = pa.table(
+                {
+                    "ts": pa.array(arr["ts"].astype("int64")),
+                    "o": pa.array(arr["o"].astype("float32")),
+                    "h": pa.array(arr["h"].astype("float32")),
+                    "l": pa.array(arr["l"].astype("float32")),
+                    "c": pa.array(arr["c"].astype("float32")),
+                    "bv": pa.array(arr["bv"].astype("float32")),
+                }
+            )
             pq.write_table(table, cache_path, compression="zstd")
             self._log("debug", "tradfi_cache_saved", path=str(cache_path))
         except Exception as e:
@@ -4041,11 +4067,27 @@ class CandlestickManager:
         if not self._archive_supported():
             return
 
+        # For stock-perps with TradFi configured, allow fetches before exchange inception
+        # so historical data can be backfilled from TradFi providers (alpaca/polygon/etc.).
+        allow_pre_inception_for_stock_perp = False
+        try:
+            from tradfi_data import is_stock_ticker
+
+            base = symbol.split("/")[0].strip()
+            tradfi_cfg = self._load_tradfi_config()
+            allow_pre_inception_for_stock_perp = bool(tradfi_cfg) and is_stock_ticker(base)
+        except Exception:
+            allow_pre_inception_for_stock_perp = False
+
         # Skip fetches before known inception date - but don't trust inception_ts blindly.
         # If inception_ts would skip the entire requested range, attempt a light probe
         # before treating it as authoritative.
         inception_ts = self._get_inception_ts(symbol)
-        if inception_ts is not None and start_ts < inception_ts:
+        if (
+            inception_ts is not None
+            and start_ts < inception_ts
+            and not allow_pre_inception_for_stock_perp
+        ):
             if inception_ts > end_ts:
                 updated = False
                 shard_min = self._get_min_shard_ts(symbol)
@@ -4074,9 +4116,7 @@ class CandlestickManager:
                         day_key = self._date_key(end_ts)
                         _, day_end = self._date_range_of_key(day_key)
                         archive_freshness_hours = 72
-                        archive_cutoff_ms = _utc_now_ms() - (
-                            archive_freshness_hours * 3600 * 1000
-                        )
+                        archive_cutoff_ms = _utc_now_ms() - (archive_freshness_hours * 3600 * 1000)
                         if day_end <= archive_cutoff_ms:
                             probed = True
                             try:
@@ -4771,9 +4811,13 @@ class CandlestickManager:
                 )
                 need_refresh = last_ref == 0 or (now - last_ref) > int(max_age_ms)
                 if not need_refresh:
-                    # If our cached data doesn't reach the requested end_ts,
-                    # force a refresh even if the last refresh is recent.
-                    if last_final and last_final < int(end_ts):
+                    # Only force refresh if cached data lags by MORE than 1 candle
+                    # period.  Being exactly 1 minute behind is normal when a new
+                    # minute boundary crosses (e.g. right after warmup).  The TTL
+                    # alone governs refresh timing in that case — avoiding a
+                    # thundering-herd where all symbols refresh simultaneously on
+                    # minute transitions.
+                    if last_final and (int(end_ts) - int(last_final)) > ONE_MIN_MS:
                         need_refresh = True
                 if need_refresh:
                     await self.refresh(symbol, through_ts=end_ts)
@@ -5688,6 +5732,14 @@ class CandlestickManager:
 
         self._current_close_cache[symbol] = (float(price), int(now))
         return float(price)
+
+    def set_current_close(self, symbol: str, price: float, timestamp_ms: int) -> None:
+        """Inject a price into the current-close cache (e.g. from a bulk API call)."""
+        self._current_close_cache[symbol] = (float(price), int(timestamp_ms))
+
+    def is_rate_limited(self) -> bool:
+        """Return True if a global rate-limit backoff is active."""
+        return self._rate_limit_until > time.time()
 
     # ----- EMA helpers -----
 

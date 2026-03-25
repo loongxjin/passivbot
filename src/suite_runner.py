@@ -42,7 +42,6 @@ from ohlcv_utils import align_and_aggregate_hlcvs
 from shared_arrays import SharedArraySpec
 from metrics_schema import flatten_metric_stats, merge_suite_payload
 
-
 # --------------------------------------------------------------------------- #
 # Data containers
 # --------------------------------------------------------------------------- #
@@ -158,8 +157,7 @@ def filter_scenarios_by_label(
     if not filtered:
         available = [s.get("label", f"<unnamed_{i}>") for i, s in enumerate(scenarios)]
         raise ValueError(
-            f"No scenarios match the requested labels {labels}. "
-            f"Available labels: {available}"
+            f"No scenarios match the requested labels {labels}. " f"Available labels: {available}"
         )
 
     return filtered
@@ -443,7 +441,10 @@ def _apply_candle_aggregation(hlcvs, timestamps, btc_usd_prices, mss, interval):
     )
     logging.debug(
         "[suite] aggregated %dm candles: %d bars -> %d bars (trimmed %d for alignment)",
-        interval, n_before, hlcvs.shape[0], offset_bars,
+        interval,
+        n_before,
+        hlcvs.shape[0],
+        offset_bars,
     )
     meta = mss.setdefault("__meta__", {})
     meta["data_interval_minutes"] = int(interval)
@@ -618,6 +619,8 @@ def apply_scenario(
     available_coins: set[str],
     base_coin_sources: Optional[Dict[str, str]] = None,
     *,
+    base_coins: Optional[List[str]] = None,
+    base_ignored: Optional[List[str]] = None,
     quiet: bool = False,
 ) -> Tuple[Dict[str, Any], List[str]]:
     cfg = deepcopy(base_config)
@@ -635,9 +638,11 @@ def apply_scenario(
         tracker.update(["backtest", "end_date"], backtest_section.get("end_date"), new_end)
         backtest_section["end_date"] = new_end
 
-    scenario_coins = list(scenario.coins) if scenario.coins is not None else list(master_coins)
+    default_coins = base_coins if base_coins is not None else master_coins
+    default_ignored = base_ignored if base_ignored is not None else master_ignored
+    scenario_coins = list(scenario.coins) if scenario.coins is not None else list(default_coins)
     scenario_ignored = (
-        list(scenario.ignored_coins) if scenario.ignored_coins is not None else list(master_ignored)
+        list(scenario.ignored_coins) if scenario.ignored_coins is not None else list(default_ignored)
     )
 
     filtered_coins = [coin for coin in scenario_coins if coin in available_coins]
@@ -834,6 +839,8 @@ async def run_backtest_scenario(
     results_root: Optional[Path],
     disable_plotting: bool,
     base_coin_sources: Optional[Dict[str, str]] = None,
+    base_coins: Optional[List[str]] = None,
+    base_ignored: Optional[List[str]] = None,
 ) -> ScenarioResult:
     from backtest import (
         build_backtest_payload,
@@ -849,6 +856,8 @@ async def run_backtest_scenario(
         available_exchanges=available_exchanges,
         available_coins=available_coins,
         base_coin_sources=base_coin_sources,
+        base_coins=base_coins,
+        base_ignored=base_ignored,
     )
     scenario_config["disable_plotting"] = disable_plotting
 
@@ -903,8 +912,7 @@ async def run_backtest_scenario(
         # Use per-exchange datasets for scenarios with exchange restrictions
         # Filter datasets to only include those requested by the scenario
         filtered_datasets = {
-            k: v for k, v in datasets.items()
-            if k != "combined" and k in scenario_exchanges
+            k: v for k, v in datasets.items() if k != "combined" and k in scenario_exchanges
         }
         if not filtered_datasets:
             raise ValueError(
@@ -1442,9 +1450,7 @@ async def run_backtest_suite_async(
     else:
         base_config["live"]["ignored_coins"] = list(master_ignored)
 
-    candle_interval = int(
-        base_config.get("backtest", {}).get("candle_interval_minutes", 1) or 1
-    )
+    candle_interval = int(base_config.get("backtest", {}).get("candle_interval_minutes", 1) or 1)
     datasets = await prepare_master_datasets(
         base_config,
         exchanges_list,
@@ -1474,6 +1480,8 @@ async def run_backtest_suite_async(
             available_exchanges=dataset_available_exchanges,
             available_coins=available_coins,
             base_coin_sources=suite_coin_sources,
+            base_coins=base_coins,
+            base_ignored=base_ignored,
             quiet=True,
         )
         coin_exchange = _compute_effective_coin_exchange(
@@ -1516,6 +1524,8 @@ async def run_backtest_suite_async(
             suite_dir,
             disable_plotting=disable_plotting,
             base_coin_sources=suite_coin_sources,
+            base_coins=base_coins,
+            base_ignored=base_ignored,
         )
         results.append(result)
         logging.info(

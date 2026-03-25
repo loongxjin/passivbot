@@ -1,5 +1,6 @@
 from __future__ import annotations
 import os
+import time
 
 # fix Crashes on Windows
 from tools.event_loop_policy import set_windows_event_loop_policy
@@ -94,7 +95,6 @@ from custom_endpoint_overrides import (
     load_custom_endpoint_config,
     resolve_custom_endpoint_override,
 )
-
 
 calc_min_entry_qty = pbr.calc_min_entry_qty_py
 round_ = pbr.round_
@@ -411,17 +411,13 @@ def compute_live_warmup_windows(
                 _get_bp(pside, "ema_span_0", sym),
                 _get_bp(pside, "ema_span_1", sym),
             )
-            if (pside == "long" and is_forager_long) or (
-                pside == "short" and is_forager_short
-            ):
+            if (pside == "long" and is_forager_long) or (pside == "short" and is_forager_short):
                 max_1m_span = max(
                     max_1m_span,
                     _get_bp(pside, "filter_volume_ema_span", sym),
                     _get_bp(pside, "filter_volatility_ema_span", sym),
                 )
-            max_h1_span = max(
-                max_h1_span, _get_bp(pside, "entry_volatility_ema_span_hours", sym)
-            )
+            max_h1_span = max(max_h1_span, _get_bp(pside, "entry_volatility_ema_span_hours", sym))
 
         if max_1m_span > 0.0:
             win = int(math.ceil(max_1m_span * span_buffer))
@@ -490,6 +486,7 @@ class Passivbot:
         )
         self._balance_override_logged = False
         self.balance = 1e-12
+        self.balance_raw = 1e-12
         self.previous_hysteresis_balance = None
         self.balance_hysteresis_snap_pct = float(
             get_optional_live_value(self.config, "balance_hysteresis_snap_pct", 0.02)
@@ -543,7 +540,11 @@ class Passivbot:
         self.start_time_ms = utc_ms()
         # CandlestickManager settings from config.live
         # Use denormalized exchange name for cache paths (e.g., "binance" not "binanceusdm")
-        cm_kwargs = {"exchange": self.cca, "exchange_name": self.exchange, "debug": self.logging_level}
+        cm_kwargs = {
+            "exchange": self.cca,
+            "exchange_name": self.exchange,
+            "debug": self.logging_level,
+        }
         mem_cap_raw = require_live_value(config, "max_memory_candles_per_symbol")
         mem_cap_effective = DEFAULT_MAX_MEMORY_CANDLES_PER_SYMBOL
         try:
@@ -585,9 +586,7 @@ class Passivbot:
                     "Unable to parse live.max_concurrent_api_requests=%r; ignoring",
                     max_concurrent,
                 )
-        raw_page_debug = get_optional_config_value(
-            config, "logging.candle_page_debug_symbols", None
-        )
+        raw_page_debug = get_optional_config_value(config, "logging.candle_page_debug_symbols", None)
         page_debug_symbols = []
         if raw_page_debug not in (None, "", []):
             if isinstance(raw_page_debug, str):
@@ -719,6 +718,12 @@ class Passivbot:
         self._unstuck_last_log_ms = 0
         self._unstuck_log_interval_ms = 5 * 60 * 1000  # 5 minutes
 
+        # Realized-loss gate logging throttle
+        self._loss_gate_last_log_ms = {}
+        self._loss_gate_log_interval_ms = 5 * 60 * 1000  # 5 minutes
+        self._orchestrator_prev_close_ema = {}
+        self._orchestrator_close_ema_fallback_counts = {}
+
     def live_value(self, key: str):
         return require_live_value(self.config, key)
 
@@ -829,7 +834,11 @@ class Passivbot:
             if pos_data.get("short", {}).get("size", 0.0) != 0.0:
                 n_short += 1
 
-        balance_str = f"{self.balance:.2f} {self.quote}"
+        balance_raw = self.get_raw_balance()
+        balance_snapped = self.get_hysteresis_snapped_balance()
+        balance_str = f"{balance_raw:.2f} {self.quote}"
+        if abs(balance_raw - balance_snapped) > 1e-9:
+            balance_str += f" (snap {balance_snapped:.2f})"
 
         # Build fills string with PnL if fills > 0
         if self._health_fills > 0:
@@ -895,8 +904,9 @@ class Passivbot:
         pnls_cumsum = np.array([ev.pnl for ev in events]).cumsum()
         pnls_cumsum_max, pnls_cumsum_last = float(pnls_cumsum.max()), float(pnls_cumsum[-1])
 
-        balance_peak = float(self.balance) + (pnls_cumsum_max - pnls_cumsum_last)
-        pct_from_peak = (float(self.balance) / balance_peak - 1.0) * 100.0
+        balance_raw = self.get_raw_balance()
+        balance_peak = balance_raw + (pnls_cumsum_max - pnls_cumsum_last)
+        pct_from_peak = (balance_raw / balance_peak - 1.0) * 100.0
         # Raw allowance WITHOUT .max(0.0) - can be negative
         allowance_raw = balance_peak * (pct * twel + pct_from_peak / 100.0)
 
@@ -945,6 +955,28 @@ class Passivbot:
         """Initialise state, warm cached data, and launch background loops."""
         self._log_startup_banner()
         logging.info("[boot] starting bot %s...", self.exchange)
+
+        # Random boot stagger to spread API load when multiple bots start simultaneously.
+        # Applies BEFORE init_markets() so even the first API calls are staggered.
+        boot_stagger = get_optional_live_value(self.config, "boot_stagger_seconds", None)
+        if boot_stagger is None:
+            exchange_lower = (self.exchange or "").lower()
+            if exchange_lower == "hyperliquid":
+                boot_stagger = 30.0
+            else:
+                boot_stagger = 0.0
+        try:
+            boot_stagger = float(boot_stagger)
+        except Exception:
+            boot_stagger = 0.0
+        if boot_stagger > 0:
+            delay = random.uniform(0, boot_stagger)
+            logging.info(
+                "[boot] stagger delay: waiting %.1fs before init (max=%.0fs)...",
+                delay, boot_stagger,
+            )
+            await asyncio.sleep(delay)
+
         await format_approved_ignored_coins(self.config, self.user_info["exchange"], quote=self.quote)
         await self.init_markets()
         # Staggered warmup of candles for approved symbols (large sets handled gracefully)
@@ -958,15 +990,9 @@ class Passivbot:
         await self.start_data_maintainers()
 
         logging.info("[boot] starting execution loop...")
-        logging.info(
-            "[boot] ══════════════════════════════════════════════════════════════════════"
-        )
-        logging.info(
-            "[boot] READY - Bot initialization complete, entering main trading loop"
-        )
-        logging.info(
-            "[boot] ══════════════════════════════════════════════════════════════════════"
-        )
+        logging.info("[boot] ══════════════════════════════════════════════════════════════════════")
+        logging.info("[boot] READY - Bot initialization complete, entering main trading loop")
+        logging.info("[boot] ══════════════════════════════════════════════════════════════════════")
         if not self.debug_mode:
             await self.run_execution_loop()
 
@@ -1045,7 +1071,8 @@ class Passivbot:
                 # Check if there's an initial entry order for this symbol/pside
                 symbol_orders = ideal_orders.get(symbol, [])
                 has_initial_entry = any(
-                    f"entry_initial" in (o[2] if len(o) > 2 else "") and pside in (o[2] if len(o) > 2 else "")
+                    f"entry_initial" in (o[2] if len(o) > 2 else "")
+                    and pside in (o[2] if len(o) > 2 else "")
                     for o in symbol_orders
                 )
                 if has_initial_entry:
@@ -1080,11 +1107,19 @@ class Passivbot:
                     if pside == "long":
                         ema_entry_price = ema_lower * (1.0 - ema_dist)
                         is_gated = current_price > ema_entry_price
-                        dist_pct = (current_price / ema_entry_price - 1.0) * 100 if ema_entry_price > 0 else 0
+                        dist_pct = (
+                            (current_price / ema_entry_price - 1.0) * 100
+                            if ema_entry_price > 0
+                            else 0
+                        )
                     else:  # short
                         ema_entry_price = ema_upper * (1.0 + ema_dist)
                         is_gated = current_price < ema_entry_price
-                        dist_pct = (1.0 - current_price / ema_entry_price) * 100 if ema_entry_price > 0 else 0
+                        dist_pct = (
+                            (1.0 - current_price / ema_entry_price) * 100
+                            if ema_entry_price > 0
+                            else 0
+                        )
 
                     if is_gated and abs(dist_pct) > 0.1:  # Only log if meaningfully gated
                         throttle_key = f"{symbol}:{pside}"
@@ -1096,7 +1131,11 @@ class Passivbot:
                         coin = symbol.split("/")[0] if "/" in symbol else symbol
                         logging.info(
                             "[ema] %s %s entry gated | price=%.4g ema_thresh=%.4g (+%.1f%% away)",
-                            coin, pside, current_price, ema_entry_price, dist_pct
+                            coin,
+                            pside,
+                            current_price,
+                            ema_entry_price,
+                            dist_pct,
                         )
                 except Exception:
                     pass  # Silently skip on any calculation errors
@@ -1385,7 +1424,7 @@ class Passivbot:
                 # Exchange-specific defaults: Hyperliquid has stricter rate limits
                 exchange_lower = self.exchange.lower() if self.exchange else ""
                 if exchange_lower == "hyperliquid":
-                    concurrency = 2
+                    concurrency = 1
                 else:
                     concurrency = 8
         concurrency = max(1, int(concurrency))
@@ -1411,13 +1450,9 @@ class Passivbot:
                     await asyncio.sleep(sleep_chunk)
                     waited += sleep_chunk
                     if waited < jitter:
-                        logging.info(
-                            "[boot] warmup jitter: %.0fs remaining...", jitter - waited
-                        )
+                        logging.info("[boot] warmup jitter: %.0fs remaining...", jitter - waited)
             else:
-                logging.info(
-                    "[boot] warmup jitter: sleeping %.1fs (max=%.0fs)", jitter, max_jitter
-                )
+                logging.info("[boot] warmup jitter: sleeping %.1fs (max=%.0fs)", jitter, max_jitter)
                 await asyncio.sleep(jitter)
 
         n = len(symbols)
@@ -1431,21 +1466,21 @@ class Passivbot:
         except Exception:
             warmup_ratio = 0.0
         try:
-            max_warmup_minutes = int(get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0)
+            max_warmup_minutes = int(
+                get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0
+            )
         except Exception:
             max_warmup_minutes = 0
         large_span_threshold = 2 * 24 * 60  # minutes; match CandlestickManager large-span logic
 
-        per_symbol_win, per_symbol_h1_hours, per_symbol_skip_historical = (
-            compute_live_warmup_windows(
-                symbols_by_side,
-                lambda pside, key, sym: self.bp(pside, key, sym),
-                forager_enabled=forager_needed,
-                window_candles=window_candles,
-                warmup_ratio=warmup_ratio,
-                max_warmup_minutes=max_warmup_minutes,
-                large_span_threshold=large_span_threshold,
-            )
+        per_symbol_win, per_symbol_h1_hours, per_symbol_skip_historical = compute_live_warmup_windows(
+            symbols_by_side,
+            lambda pside, key, sym: self.bp(pside, key, sym),
+            forager_enabled=forager_needed,
+            window_candles=window_candles,
+            warmup_ratio=warmup_ratio,
+            max_warmup_minutes=max_warmup_minutes,
+            large_span_threshold=large_span_threshold,
         )
         end_final_hour = (now // (60 * ONE_MIN_MS)) * (60 * ONE_MIN_MS) - 60 * ONE_MIN_MS
         try:
@@ -1520,6 +1555,8 @@ class Passivbot:
             # Enable batch mode for candle replacement logs during warmup
             self.cm.start_candle_replace_batch()
 
+        fetch_delay_s = self._get_fetch_delay_seconds()
+
         async def one(sym: str):
             nonlocal completed, last_log_ms
             async with sem:
@@ -1539,6 +1576,8 @@ class Passivbot:
                 except Exception:
                     pass
                 finally:
+                    if fetch_delay_s > 0:
+                        await asyncio.sleep(fetch_delay_s)
                     completed += 1
                     # Time-based throttle: log every ~2s or on completion
                     if n > 20:
@@ -1558,6 +1597,7 @@ class Passivbot:
 
         # Warm 1h candles for grid log-range EMAs
         hour_sem = asyncio.Semaphore(max(1, int(concurrency)))
+
         async def warm_hour(sym: str):
             async with hour_sem:
                 warm_hours = int(per_symbol_h1_hours.get(sym, 0) or 0)
@@ -1577,6 +1617,9 @@ class Passivbot:
                     )
                 except Exception:
                     pass
+                finally:
+                    if fetch_delay_s > 0:
+                        await asyncio.sleep(fetch_delay_s)
 
         await asyncio.gather(*(warm_hour(s) for s in symbols))
 
@@ -1730,7 +1773,9 @@ class Passivbot:
         except Exception:
             warmup_ratio = 0.0
         try:
-            max_warmup_minutes = int(get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0)
+            max_warmup_minutes = int(
+                get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0
+            )
         except Exception:
             max_warmup_minutes = 0
 
@@ -1857,6 +1902,12 @@ class Passivbot:
                     await asyncio.sleep(0.1)
             except RestartBotException:
                 raise  # Propagate restart without incrementing error count
+            except RateLimitExceeded as e:
+                self._health_errors += 1
+                self._health_rate_limits += 1
+                logging.warning("[rate] execution loop hit rate limit; backing off 5s...")
+                await self.restart_bot_on_too_many_errors()
+                await asyncio.sleep(5.0)
             except Exception as e:
                 self._health_errors += 1
                 logging.error(f"error with {get_function_name()} {e}")
@@ -1975,8 +2026,10 @@ class Passivbot:
         if self.debug_mode:
             if to_create:
                 print(f"would create {len(to_create)} order{'s' if len(to_create) > 1 else ''}")
-        elif self.balance < self.balance_threshold:
-            logging.info("[balance] too low: %.2f %s; not creating orders", self.balance, self.quote)
+        elif self.get_raw_balance() < self.balance_threshold:
+            logging.info(
+                "[balance] too low: %.2f %s; not creating orders", self.get_raw_balance(), self.quote
+            )
         else:
             # to_create_mod = [x for x in to_create if not order_has_match(x, to_cancel)]
             to_create_mod = []
@@ -2325,6 +2378,58 @@ class Passivbot:
             return
         apply_rest_overrides_to_ccxt(client, self.endpoint_override)
 
+    def _compute_fetch_budget_ttls(
+        self, syms: list, max_age_ms: Optional[int], max_network_fetches: Optional[int]
+    ) -> Tuple[Dict[str, int], set]:
+        """Compute per-symbol TTLs with fetch budget, return (per_sym_ttl, cache_only_never_fetched).
+
+        Symbols within the fetch budget get the real max_age_ms; symbols over the
+        budget get a huge TTL so they only use cached data.  Symbols assigned
+        cache-only TTL that have never been fetched are collected into a skip set
+        (get_candles treats last_refresh_ms==0 as "needs refresh" regardless of TTL).
+        """
+        CACHE_ONLY_TTL = 365 * 24 * 3600 * 1000  # ~1 year – effectively cache-only
+        per_sym_ttl: Dict[str, int] = {}
+        if max_network_fetches is not None and max_network_fetches >= 0 and max_age_ms is not None:
+            now = utc_ms()
+            staleness = []
+            for s in syms:
+                try:
+                    last_ref = self.cm.get_last_refresh_ms(s)
+                except Exception:
+                    last_ref = 0
+                staleness.append((s, int(now - last_ref) if last_ref > 0 else now))
+            staleness.sort(key=lambda x: x[1], reverse=True)  # most stale first
+            fetch_set = set(s for s, _ in staleness[:max_network_fetches])
+            for s in syms:
+                per_sym_ttl[s] = int(max_age_ms) if s in fetch_set else CACHE_ONLY_TTL
+        else:
+            for s in syms:
+                per_sym_ttl[s] = int(max_age_ms) if max_age_ms is not None else 0
+
+        cache_only_never_fetched: set = set()
+        for s in syms:
+            if per_sym_ttl.get(s) == CACHE_ONLY_TTL:
+                try:
+                    if self.cm.get_last_refresh_ms(s) == 0:
+                        cache_only_never_fetched.add(s)
+                except Exception:
+                    cache_only_never_fetched.add(s)
+
+        return per_sym_ttl, cache_only_never_fetched
+
+    def _get_fetch_delay_seconds(self) -> float:
+        """Return configured per-fetch delay in seconds (default 0.2s for Hyperliquid)."""
+        fetch_delay_ms = get_optional_live_value(self.config, "warmup_fetch_delay_ms", None)
+        try:
+            fetch_delay_ms = float(fetch_delay_ms) if fetch_delay_ms is not None else None
+        except Exception:
+            fetch_delay_ms = None
+        if fetch_delay_ms is None:
+            exchange_lower = self.exchange.lower() if self.exchange else ""
+            fetch_delay_ms = 200.0 if exchange_lower == "hyperliquid" else 0.0
+        return max(0.0, float(fetch_delay_ms) / 1000.0)
+
     def stop_data_maintainers(self, verbose=True):
         """Cancel background candle/orderbook tasks and log the outcome."""
         if not hasattr(self, "maintainers"):
@@ -2594,13 +2699,31 @@ class Passivbot:
         self.set_wallet_exposure_limits()
         previous_PB_modes = deepcopy(self.PB_modes) if hasattr(self, "PB_modes") else None
         self.PB_modes = {"long": {}, "short": {}}
+        # Compute a shared forager fetch budget once per cycle and split it fairly by side.
+        # This avoids deterministic long->short starvation when budget is tight.
+        side_fetch_budgets: Dict[str, int] = {}
+        max_calls = get_optional_live_value(self.config, "max_ohlcv_fetches_per_minute", 0)
+        try:
+            max_calls = int(max_calls) if max_calls is not None else 0
+        except Exception:
+            max_calls = 0
+        if max_calls > 0:
+            forager_sides = [pside for pside in ("long", "short") if self.is_forager_mode(pside)]
+            if forager_sides:
+                total_budget = self._forager_refresh_budget(max_calls)
+                side_fetch_budgets = self._split_forager_budget_by_side(total_budget, forager_sides)
         for pside, other_pside in [("long", "short"), ("short", "long")]:
             if self.is_forager_mode(pside):
                 await self.update_first_timestamps()
             for symbol in self.coin_overrides:
                 if flag := self.get_forced_PB_mode(pside, symbol):
                     self.PB_modes[pside][symbol] = flag
-            ideal_coins = await self.get_filtered_coins(pside)
+            ideal_coins = await self.get_filtered_coins(
+                pside,
+                max_network_fetches=(
+                    side_fetch_budgets[pside] if pside in side_fetch_budgets else None
+                ),
+            )
             slots_filled = {
                 k for k, v in self.PB_modes[pside].items() if v in ["normal", "graceful_stop"]
             }
@@ -2707,7 +2830,9 @@ class Passivbot:
                             # Forager selection - always useful
                             should_log_info = True
                             if pside_info["open"]:
-                                info_suffix = f" (forager slot {pside_info['current']+1}/{pside_info['max']})"
+                                info_suffix = (
+                                    f" (forager slot {pside_info['current']+1}/{pside_info['max']})"
+                                )
                             else:
                                 info_suffix = f" (slot {pside_info['current']}/{pside_info['max']})"
                         elif is_first_run:
@@ -2722,8 +2847,7 @@ class Passivbot:
                     elif change_type == "changed":
                         # Mode changed - check if it's oscillation or significant
                         is_oscillation = (
-                            "normal -> graceful_stop" in elm
-                            or "graceful_stop -> normal" in elm
+                            "normal -> graceful_stop" in elm or "graceful_stop -> normal" in elm
                         )
                         if is_oscillation:
                             # Oscillation - suppress at INFO (already logged at DEBUG)
@@ -2749,7 +2873,9 @@ class Passivbot:
                         pass
                     logging.info("[mode] %s %s%s", change_type, elm, info_suffix)
 
-    async def get_filtered_coins(self, pside: str) -> List[str]:
+    async def get_filtered_coins(
+        self, pside: str, *, max_network_fetches: Optional[int] = None
+    ) -> List[str]:
         """Select ideal coins for a side using EMA-based volume and log-range filters.
 
         Steps (for forager mode):
@@ -2782,28 +2908,43 @@ class Passivbot:
             clip_pct = self.bot_value(pside, "filter_volume_drop_pct")
             volatility_drop = self.bot_value(pside, "filter_volatility_drop_pct")
             max_n_positions = self.get_max_n_positions(pside)
-            # Best-effort ranking when slots are full: use dynamic staleness budget.
+            # Apply max_ohlcv_fetches_per_minute in all cases (slots open or full).
+            max_calls = get_optional_live_value(self.config, "max_ohlcv_fetches_per_minute", 0)
+            try:
+                max_calls = int(max_calls) if max_calls is not None else 0
+            except Exception:
+                max_calls = 0
             if slots_open:
-                max_age_ms = 60_000
+                rate_limit_age_ms = self._forager_target_staleness_ms(len(candidates), max_calls)
+                # Respect rate limit even with open slots; floor at 60s for responsiveness.
+                max_age_ms = max(60_000, rate_limit_age_ms) if max_calls > 0 else 60_000
             else:
-                max_calls = get_optional_live_value(
-                    self.config, "max_ohlcv_fetches_per_minute", 0
-                )
-                try:
-                    max_calls = int(max_calls) if max_calls is not None else 0
-                except Exception:
-                    max_calls = 0
                 max_age_ms = self._forager_target_staleness_ms(len(candidates), max_calls)
+            # Use pre-computed per-side budget from caller if available;
+            # otherwise fall back to computing it here (for backward compat).
+            if max_network_fetches is None:
+                fetch_budget = self._forager_refresh_budget(max_calls) if max_calls > 0 else None
+            else:
+                try:
+                    fetch_budget = max(0, int(max_network_fetches))
+                except Exception:
+                    fetch_budget = 0
             if clip_pct > 0.0:
                 volumes, log_ranges = await self.calc_volumes_and_log_ranges(
-                    pside, symbols=candidates, max_age_ms=max_age_ms
+                    pside,
+                    symbols=candidates,
+                    max_age_ms=max_age_ms,
+                    max_network_fetches=fetch_budget,
                 )
             else:
                 volumes = {
                     symbol: float(len(candidates) - idx) for idx, symbol in enumerate(candidates)
                 }
                 log_ranges = await self.calc_log_range(
-                    pside, eligible_symbols=candidates, max_age_ms=max_age_ms
+                    pside,
+                    eligible_symbols=candidates,
+                    max_age_ms=max_age_ms,
+                    max_network_fetches=fetch_budget,
                 )
             features = [
                 {
@@ -2841,11 +2982,16 @@ class Passivbot:
         symbols: Optional[Iterable[str]] = None,
         *,
         max_age_ms: Optional[int] = 60_000,
+        max_network_fetches: Optional[int] = None,
     ) -> Tuple[Dict[str, float], Dict[str, float]]:
         """Compute 1m EMA quote volume and 1m EMA log range per symbol with one candles fetch.
 
         This uses CandlestickManager.get_latest_ema_metrics() to avoid calling get_candles() twice
         per symbol (once for volume and once for log range).
+
+        If *max_network_fetches* is set, at most that many symbols will be allowed to
+        trigger a network fetch.  The remaining symbols receive a very large TTL so they
+        return cached data (or 0.0 if nothing is cached) without hitting the API.
         """
         span_volume = int(round(self.bot_value(pside, "filter_volume_ema_span")))
         span_volatility = int(round(self.bot_value(pside, "filter_volatility_ema_span")))
@@ -2854,7 +3000,9 @@ class Passivbot:
         except Exception:
             warmup_ratio = 0.0
         try:
-            max_warmup_minutes = int(get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0)
+            max_warmup_minutes = int(
+                get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0
+            )
         except Exception:
             max_warmup_minutes = 0
         span_buffer = 1.0 + max(0.0, warmup_ratio)
@@ -2865,20 +3013,30 @@ class Passivbot:
         if symbols is None:
             symbols = self.get_symbols_approved_or_has_pos(pside)
 
+        syms = list(symbols)
+
+        per_sym_ttl, cache_only_never_fetched = self._compute_fetch_budget_ttls(
+            syms, max_age_ms, max_network_fetches
+        )
+
         async def one(symbol: str):
             try:
-                if max_age_ms is not None:
-                    ttl = int(max_age_ms)
-                else:
-                    has_pos = self.has_position(symbol)
-                    has_oo = (
-                        bool(self.open_orders.get(symbol)) if hasattr(self, "open_orders") else False
-                    )
-                    ttl = (
-                        60_000
-                        if (has_pos or has_oo)
-                        else int(getattr(self, "inactive_coin_candle_ttl_ms", 600_000))
-                    )
+                if symbol in cache_only_never_fetched:
+                    return (0.0, 0.0)
+                ttl = per_sym_ttl.get(symbol)
+                if ttl is None or ttl == 0:
+                    if max_age_ms is not None:
+                        ttl = int(max_age_ms)
+                    else:
+                        has_pos = self.has_position(symbol)
+                        has_oo = (
+                            bool(self.open_orders.get(symbol)) if hasattr(self, "open_orders") else False
+                        )
+                        ttl = (
+                            60_000
+                            if (has_pos or has_oo)
+                            else int(getattr(self, "inactive_coin_candle_ttl_ms", 600_000))
+                        )
                 res = await self.cm.get_latest_ema_metrics(
                     symbol,
                     {"qv": span_volume, "log_range": span_volatility},
@@ -2892,7 +3050,6 @@ class Passivbot:
             except Exception:
                 return (0.0, 0.0)
 
-        syms = list(symbols)
         tasks = {s: asyncio.create_task(one(s)) for s in syms}
         volumes: Dict[str, float] = {}
         log_ranges: Dict[str, float] = {}
@@ -2909,7 +3066,9 @@ class Passivbot:
         # Log only when rankings have changed since last logged snapshot.
         elapsed_s = max(0.001, (utc_ms() - started_ms) / 1000.0)
         now_ms = utc_ms()
-        ema_log_throttle_ms = 300_000  # 5 minutes between logs per metric (reduced from 60s to reduce forager noise)
+        ema_log_throttle_ms = (
+            300_000  # 5 minutes between logs per metric (reduced from 60s to reduce forager noise)
+        )
 
         if volumes:
             top_n = min(8, len(volumes))
@@ -3011,7 +3170,7 @@ class Passivbot:
                     )
 
     def get_wallet_exposure_limit(self, pside, symbol=None):
-        """Return the wallet exposure limit for a side, honoring per-symbol overrides."""
+        """Return side WEL from fixed config denominator, honoring per-symbol overrides."""
         if symbol:
             fwel = (
                 self.coin_overrides.get(symbol, {})
@@ -3024,8 +3183,8 @@ class Passivbot:
         twel = self.bot_value(pside, "total_wallet_exposure_limit")
         if twel <= 0.0:
             return 0.0
-        n_positions = max(self.get_max_n_positions(pside), self.get_current_n_positions(pside))
-        if n_positions == 0:
+        n_positions = int(round(self.bot_value(pside, "n_positions")))
+        if n_positions <= 0:
             return 0.0
         return round(twel / n_positions, 8)
 
@@ -3044,23 +3203,22 @@ class Passivbot:
         allowance_pct = float(self.bp(pside, "risk_we_excess_allowance_pct", symbol))
         allowance_multiplier = 1.0 + max(0.0, allowance_pct)
         effective_limit = base_limit * allowance_multiplier
-        min_entry_cost = self.balance * effective_limit * self.bp(pside, "entry_initial_qty_pct", symbol)
-        effective_min_cost = self.effective_min_cost.get(symbol, 0.0)
-        result = min_entry_cost >= effective_min_cost
-        # Debug logging for troubleshooting
-        if not hasattr(self, "_emc_debug_logged"):
-            self._emc_debug_logged = set()
-        debug_key = (symbol, pside)
-        if debug_key not in self._emc_debug_logged:
-            logging.info(
-                f"[debug] effective_min_cost check for {symbol} {pside}: "
-                f"balance={self.balance:.2f}, base_limit={base_limit:.4f}, "
-                f"entry_initial_qty_pct={self.bp(pside, 'entry_initial_qty_pct', symbol):.4f}, "
-                f"min_entry_cost={min_entry_cost:.2f}, effective_min_cost={effective_min_cost:.2f}, "
-                f"result={result}"
-            )
-            self._emc_debug_logged.add(debug_key)
-        return result
+        return (
+            self.get_hysteresis_snapped_balance()
+            * effective_limit
+            * self.bp(pside, "entry_initial_qty_pct", symbol)
+            >= self.effective_min_cost.get(symbol, float("inf"))
+        )
+
+    def get_hysteresis_snapped_balance(self) -> float:
+        """Return hysteresis-snapped balance used for sizing."""
+        return float(getattr(self, "balance", 0.0) or 0.0)
+
+    def get_raw_balance(self) -> float:
+        """Return raw wallet balance (fallback to snapped for legacy test stubs)."""
+        if hasattr(self, "balance_raw"):
+            return float(getattr(self, "balance_raw", 0.0) or 0.0)
+        return self.get_hysteresis_snapped_balance()
 
     def add_new_order(self, order, source="WS"):
         """No-op placeholder; subclasses update open orders through REST synchronisation."""
@@ -3077,19 +3235,42 @@ class Passivbot:
         return
 
     async def handle_balance_update(self, source="REST"):
-        if not hasattr(self, "_previous_balance"):
-            self._previous_balance = 0.0
-        if self.balance != self._previous_balance:
+        if not hasattr(self, "_previous_balance_raw"):
+            self._previous_balance_raw = 0.0
+        if not hasattr(self, "_previous_balance_snapped"):
+            self._previous_balance_snapped = 0.0
+        if not hasattr(self, "_last_raw_only_log_time"):
+            self._last_raw_only_log_time = 0.0
+        balance_raw = self.get_raw_balance()
+        balance_snapped = self.get_hysteresis_snapped_balance()
+        if (
+            balance_raw != self._previous_balance_raw
+            or balance_snapped != self._previous_balance_snapped
+        ):
+            snap_changed = balance_snapped != self._previous_balance_snapped
+            raw_only = not snap_changed
+            now = time.time()
+            should_log = snap_changed or (now - self._last_raw_only_log_time >= 900.0)
             try:
-                equity = self.balance + (await self.calc_upnl_sum())
-                logging.info(
-                    f"[balance] {self._previous_balance} -> {self.balance} equity: {equity:.4f} source: {source}"
-                )
+                if should_log:
+                    equity = balance_raw + (await self.calc_upnl_sum())
+                    logging.info(
+                        "[balance] raw %.6f -> %.6f | snap %.6f -> %.6f | equity: %.4f source: %s",
+                        self._previous_balance_raw,
+                        balance_raw,
+                        self._previous_balance_snapped,
+                        balance_snapped,
+                        equity,
+                        source,
+                    )
+                    if raw_only:
+                        self._last_raw_only_log_time = now
             except Exception as e:
                 logging.error(f"error with handle_balance_update {e}")
                 traceback.print_exc()
             finally:
-                self._previous_balance = self.balance
+                self._previous_balance_raw = balance_raw
+                self._previous_balance_snapped = balance_snapped
                 self.execution_scheduled = True
 
     async def calc_upnl_sum(self):
@@ -3142,6 +3323,28 @@ class Passivbot:
 
             # Load cached events
             await self._pnls_manager.ensure_loaded()
+
+            # Bybit cache doctor runs by default on startup to self-heal known duplicate-fill issues.
+            doctor_mode = str(os.getenv("PASSIVBOT_FILL_EVENTS_DOCTOR", "")).strip().lower()
+            if self.exchange == "bybit":
+                if doctor_mode not in ("0", "false", "off", "disable", "disabled"):
+                    auto_repair = doctor_mode not in ("check", "scan", "detect")
+                    report = await self._pnls_manager.run_doctor(auto_repair=auto_repair)
+                    logging.info(
+                        "[fills-doctor] startup report anomalies=%s repaired=%s mode=%s",
+                        report.get("anomaly_events", 0),
+                        report.get("repaired", False),
+                        doctor_mode or ("repair" if auto_repair else "check"),
+                    )
+            elif doctor_mode:
+                auto_repair = doctor_mode in ("1", "true", "yes", "repair", "fix", "auto")
+                report = await self._pnls_manager.run_doctor(auto_repair=auto_repair)
+                logging.info(
+                    "[fills-doctor] startup report anomalies=%s repaired=%s mode=%s",
+                    report.get("anomaly_events", 0),
+                    report.get("repaired", False),
+                    doctor_mode,
+                )
 
             cached_count = len(self._pnls_manager._events)
             logging.info("[fills] initialized: %d cached events loaded", cached_count)
@@ -3201,7 +3404,9 @@ class Passivbot:
             if needs_full_refresh:
                 # Full refresh with proper lookback window
                 if not getattr(self, "_fills_full_refresh_logged", False):
-                    logging.debug("[fills] Performing full refresh from %s", ts_to_date(age_limit)[:19])
+                    logging.debug(
+                        "[fills] Performing full refresh from %s", ts_to_date(age_limit)[:19]
+                    )
                 await self._pnls_manager.refresh(start_ms=int(age_limit), end_ms=None)
             else:
                 # Incremental refresh
@@ -3324,22 +3529,16 @@ class Passivbot:
         if not events:
             return {"long": 0.0, "short": 0.0}
 
-        pnls_cumsum = np.array([ev.pnl for ev in events]).cumsum()
+        pnls_cumsum = np.array([float(ev.pnl) for ev in events], dtype=float).cumsum()
         pnls_cumsum_max, pnls_cumsum_last = pnls_cumsum.max(), pnls_cumsum[-1]
         out = {}
+        balance_raw = self.get_raw_balance()
         for pside in ["long", "short"]:
             pct = float(self.bot_value(pside, "unstuck_loss_allowance_pct") or 0.0)
             if pct > 0.0:
-                balance_peak = self.balance + (pnls_cumsum_max - pnls_cumsum_last)
-                drop_since_peak_pct = self.balance / balance_peak - 1.0
-                allowance_raw = balance_peak * (pct + drop_since_peak_pct)
-                allowance_mod = balance_peak * (
-                    pct * float(self.bot_value(pside, "total_wallet_exposure_limit") or 0.0)
-                    + drop_since_peak_pct
-                )
                 out[pside] = float(
                     pbr.calc_auto_unstuck_allowance(
-                        float(self.balance),
+                        balance_raw,
                         pct * float(self.bot_value(pside, "total_wallet_exposure_limit") or 0.0),
                         float(pnls_cumsum_max),
                         float(pnls_cumsum_last),
@@ -3348,6 +3547,55 @@ class Passivbot:
             else:
                 out[pside] = 0.0
         return out
+
+    def _get_realized_pnl_cumsum_stats(self) -> dict[str, float]:
+        """Return gross realized pnl cumsum peak/current from FillEventsManager history."""
+        if self._pnls_manager is None:
+            return {"max": 0.0, "last": 0.0}
+        events = self._pnls_manager.get_events()
+        if not events:
+            return {"max": 0.0, "last": 0.0}
+        pnls_cumsum = np.array([float(ev.pnl) for ev in events], dtype=float).cumsum()
+        return {"max": float(pnls_cumsum.max()), "last": float(pnls_cumsum[-1])}
+
+    def _log_realized_loss_gate_blocks(self, out: dict, idx_to_symbol: dict[int, str]) -> None:
+        """Emit visible warnings for close orders blocked by realized-loss gate."""
+        diagnostics = out.get("diagnostics", {}) if isinstance(out, dict) else {}
+        blocks = diagnostics.get("loss_gate_blocks", [])
+        if not isinstance(blocks, list) or not blocks:
+            return
+        now_ms = utc_ms()
+        for block in blocks:
+            if not isinstance(block, dict):
+                continue
+            symbol = idx_to_symbol.get(int(block.get("symbol_idx", -1)), "unknown")
+            pside = str(block.get("pside", "unknown"))
+            order_type = str(block.get("order_type", "unknown"))
+            throttle_key = f"{symbol}:{pside}:{order_type}"
+            last_log_ms = self._loss_gate_last_log_ms.get(throttle_key, 0)
+            if (now_ms - last_log_ms) < self._loss_gate_log_interval_ms:
+                continue
+            self._loss_gate_last_log_ms[throttle_key] = now_ms
+            qty = float(block.get("qty", 0.0) or 0.0)
+            price = float(block.get("price", 0.0) or 0.0)
+            projected_pnl = float(block.get("projected_pnl", 0.0) or 0.0)
+            projected_balance = float(block.get("projected_balance_after", 0.0) or 0.0)
+            balance_floor = float(block.get("balance_floor", 0.0) or 0.0)
+            max_loss_pct = float(block.get("max_realized_loss_pct", 1.0) or 1.0)
+            logging.warning(
+                "[risk] order blocked by realized-loss gate | %s %s %s qty=%.10g price=%.10g "
+                "projected_pnl=%.6f projected_balance=%.6f floor=%.6f max_realized_loss_pct=%.6f | "
+                "adjust live.max_realized_loss_pct to change behavior",
+                symbol,
+                pside,
+                order_type,
+                qty,
+                price,
+                projected_pnl,
+                projected_balance,
+                balance_floor,
+                max_loss_pct,
+            )
 
     # Legacy init_fill_events, update_fill_events, etc. removed - using FillEventsManager
 
@@ -3482,7 +3730,7 @@ class Passivbot:
         if not events:
             ts_now = self.get_exchange_time()
             balance_now = (
-                float(current_balance) if current_balance is not None else float(self.balance)
+                float(current_balance) if current_balance is not None else self.get_raw_balance()
             )
             point = {
                 "timestamp": ts_now,
@@ -3511,7 +3759,9 @@ class Passivbot:
         lookback_ms = max(lookback_days, 0.0) * 24 * 60 * 60 * 1000
         lookback_start = ts_now - lookback_ms
 
-        balance_now = float(current_balance) if current_balance is not None else float(self.balance)
+        balance_now = (
+            float(current_balance) if current_balance is not None else self.get_raw_balance()
+        )
         balance_now = max(balance_now, 0.0)
         total_realised = sum(
             evt["pnl"] + evt.get("fee", 0.0) for evt in events if evt["timestamp"] <= ts_now
@@ -3763,13 +4013,14 @@ class Passivbot:
 
         # Pre-calculate total WE per side for TWEL% display
         total_we_by_pside = {"long": 0.0, "short": 0.0}
+        balance_raw = self.get_raw_balance()
         for pos in positions_new:
             sym = pos["symbol"]
             ps = pos["position_side"]
             sz = pos.get("size", 0.0)
             px = pos.get("price", 0.0)
-            if sz != 0 and self.balance > 0 and sym in self.c_mults:
-                total_we_by_pside[ps] += pbr.qty_to_cost(sz, px, self.c_mults[sym]) / self.balance
+            if sz != 0 and balance_raw > 0 and sym in self.c_mults:
+                total_we_by_pside[ps] += pbr.qty_to_cost(sz, px, self.c_mults[sym]) / balance_raw
 
         # Create PrettyTable for aligned output
         table = PrettyTable()
@@ -3795,8 +4046,8 @@ class Passivbot:
 
             # Compute metrics for new pos
             wallet_exposure = (
-                pbr.qty_to_cost(new["size"], new["price"], self.c_mults[symbol]) / self.balance
-                if new["size"] != 0 and self.balance > 0
+                pbr.qty_to_cost(new["size"], new["price"], self.c_mults[symbol]) / balance_raw
+                if new["size"] != 0 and balance_raw > 0
                 else 0.0
             )
             wel = float(self.bp(pside, "wallet_exposure_limit", symbol))
@@ -3932,36 +4183,43 @@ class Passivbot:
             self.previous_hysteresis_balance = None
         if not hasattr(self, "balance_hysteresis_snap_pct"):
             self.balance_hysteresis_snap_pct = 0.02
+        if not hasattr(self, "balance_raw"):
+            self.balance_raw = self.get_raw_balance()
 
         if self.balance_override is not None:
-            balance = float(self.balance_override)
+            balance_raw = float(self.balance_override)
             if not self._balance_override_logged:
-                logging.info("Using balance override: %.6f", balance)
+                logging.info("Using balance override: %.6f", balance_raw)
                 self._balance_override_logged = True
         else:
             if not hasattr(self, "fetch_balance"):
                 logging.debug("update_balance: no fetch_balance implemented")
                 return False
-            balance = await self.fetch_balance()
+            balance_raw = await self.fetch_balance()
 
         # Only accept numeric balances; keep previous value on failure
-        if balance is None:
+        if balance_raw is None:
             logging.warning("balance fetch returned None; keeping previous balance")
             return False
         try:
-            balance = float(balance)
+            balance_raw = float(balance_raw)
         except (TypeError, ValueError):
             logging.warning("non-numeric balance fetch result; keeping previous balance")
             return False
+        if not math.isfinite(balance_raw):
+            logging.warning("non-finite balance fetch result; keeping previous balance")
+            return False
 
+        balance_snapped = balance_raw
         if self.balance_override is None:
             if self.previous_hysteresis_balance is None:
-                self.previous_hysteresis_balance = balance
-            balance = pbr.hysteresis(
-                balance, self.previous_hysteresis_balance, self.balance_hysteresis_snap_pct
+                self.previous_hysteresis_balance = balance_raw
+            balance_snapped = pbr.hysteresis(
+                balance_raw, self.previous_hysteresis_balance, self.balance_hysteresis_snap_pct
             )
-            self.previous_hysteresis_balance = balance
-        self.balance = balance
+            self.previous_hysteresis_balance = balance_snapped
+        self.balance_raw = balance_raw
+        self.balance = balance_snapped
         return True
 
     async def update_positions_and_balance(self):
@@ -4090,6 +4348,8 @@ class Passivbot:
         h1_log_range_emas = snapshot["h1_log_range_emas"]
 
         unstuck_allowances = snapshot.get("unstuck_allowances", {"long": 0.0, "short": 0.0})
+        realized_pnl_cumsum = snapshot.get("realized_pnl_cumsum", {"max": 0.0, "last": 0.0})
+        max_realized_loss_pct = float(self.live_value("max_realized_loss_pct") or 1.0)
 
         global_bp = {
             "long": self._bot_params_to_rust_dict("long", None),
@@ -4099,11 +4359,15 @@ class Passivbot:
         # If either is False, we block same-coin hedging in the orchestrator.
         effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
         input_dict = {
-            "balance": float(self.balance),
+            "balance": self.get_hysteresis_snapped_balance(),
+            "balance_raw": self.get_raw_balance(),
             "global": {
                 "filter_by_min_effective_cost": bool(self.live_value("filter_by_min_effective_cost")),
                 "unstuck_allowance_long": float(unstuck_allowances.get("long", 0.0)),
                 "unstuck_allowance_short": float(unstuck_allowances.get("short", 0.0)),
+                "max_realized_loss_pct": max_realized_loss_pct,
+                "realized_pnl_cumsum_max": float(realized_pnl_cumsum.get("max", 0.0) or 0.0),
+                "realized_pnl_cumsum_last": float(realized_pnl_cumsum.get("last", 0.0) or 0.0),
                 "sort_global": True,
                 "global_bot_params": global_bp,
                 "hedge_mode": effective_hedge_mode,
@@ -4202,6 +4466,7 @@ class Passivbot:
                         logging.error("[ema] Missing EMA for %s (symbol_idx=%d)", symbol, idx)
             raise
         out = json.loads(out_json)
+        self._log_realized_loss_gate_blocks(out, idx_to_symbol)
         orders = out.get("orders", [])
 
         ideal_orders: dict[str, list] = {}
@@ -4234,7 +4499,13 @@ class Passivbot:
                     allowance = unstuck_allowances.get(pside, 0.0)
                     logging.info(
                         "[unstuck] selecting %s %s | entry=%.2f now=%.2f (%s%.1f%%) | allowance=%.2f",
-                        coin, pside, entry_price, current_price, sign, price_diff_pct, allowance
+                        coin,
+                        pside,
+                        entry_price,
+                        current_price,
+                        sign,
+                        price_diff_pct,
+                        allowance,
                     )
                 break  # Only one unstuck order per cycle
 
@@ -4308,23 +4579,137 @@ class Passivbot:
         m1_lr_spans = sorted(
             {s for s in (lr_span_long, lr_span_short) if s > 0.0 and math.isfinite(s)}
         )
+        if not hasattr(self, "_orchestrator_prev_close_ema"):
+            self._orchestrator_prev_close_ema = {}
+        if not hasattr(self, "_orchestrator_close_ema_fallback_counts"):
+            self._orchestrator_close_ema_fallback_counts = {}
 
-        async def fetch_map(symbol: str, spans: list[float], fn):
+        async def fetch_map(symbol: str, spans: list[float], fn, ema_type: str):
             out: dict[float, float] = {}
             if not spans:
                 return out
-            tasks = [asyncio.create_task(fn(symbol, sp)) for sp in spans]
-            results = await asyncio.gather(*tasks, return_exceptions=True)
-            for sp, res in zip(spans, results):
-                if isinstance(res, Exception):
+            for sp in spans:
+                span = float(sp)
+                try:
+                    val = float(await fn(symbol, span))
+                except Exception as e:
+                    logging.warning(
+                        "[ema] dropping %s span for %s span=%.8g reason=%s: %s",
+                        ema_type,
+                        symbol,
+                        span,
+                        type(e).__name__,
+                        e,
+                    )
                     continue
-                val = float(res)
                 if math.isfinite(val):
-                    out[float(sp)] = val
+                    out[span] = val
+                else:
+                    logging.warning(
+                        "[ema] dropping %s span for %s span=%.8g reason=non-finite value %s",
+                        ema_type,
+                        symbol,
+                        span,
+                        val,
+                    )
+            return out
+
+        async def fetch_required_map(symbol: str, spans: list[float], fn, ema_type: str):
+            out: dict[float, float] = {}
+            if not spans:
+                return out
+            missing: list[tuple[float, str]] = []
+            for sp in spans:
+                span = float(sp)
+                try:
+                    val = float(await fn(symbol, span))
+                except Exception as e:
+                    reason = f"{type(e).__name__}: {e}"
+                else:
+                    if math.isfinite(val):
+                        out[span] = val
+                        continue
+                    reason = f"non-finite {ema_type} value {val}"
+                logging.warning(
+                    "[ema] missing required %s span for %s span=%.8g reason=%s",
+                    ema_type,
+                    symbol,
+                    span,
+                    reason,
+                )
+                missing.append((span, reason))
+            if missing:
+                detail = "; ".join([f"span={sp:.8g} reason={why}" for sp, why in missing])
+                raise RuntimeError(f"[ema] missing required {ema_type} EMA for {symbol}: {detail}")
+            return out
+
+        async def fetch_close_map(symbol: str, spans: list[float]) -> dict[float, float]:
+            out: dict[float, float] = {}
+            if not spans:
+                return out
+            now_ms = int(utc_ms())
+            prev_by_span = self._orchestrator_prev_close_ema.setdefault(symbol, {})
+            missing: list[tuple[float, str]] = []
+            for sp in spans:
+                span = float(sp)
+                key = (symbol, span)
+                reason = None
+                try:
+                    val = float(await ema_close(symbol, span))
+                except Exception as e:
+                    reason = f"{type(e).__name__}: {e}"
+                else:
+                    if math.isfinite(val):
+                        out[span] = val
+                        prev_by_span[span] = (val, now_ms)
+                        prev_fallback_count = int(
+                            self._orchestrator_close_ema_fallback_counts.get(key, 0)
+                        )
+                        if prev_fallback_count > 0:
+                            logging.info(
+                                "[ema] close EMA recovered %s span=%.8g after %d fallback(s)",
+                                symbol,
+                                span,
+                                prev_fallback_count,
+                            )
+                        self._orchestrator_close_ema_fallback_counts[key] = 0
+                    else:
+                        reason = f"non-finite close EMA value {val}"
+                if reason is None:
+                    continue
+                prev = prev_by_span.get(span)
+                if prev is not None:
+                    prev_val = float(prev[0])
+                    prev_ts = int(prev[1])
+                    if math.isfinite(prev_val):
+                        out[span] = prev_val
+                        n_fallbacks = int(
+                            self._orchestrator_close_ema_fallback_counts.get(key, 0)
+                        ) + 1
+                        self._orchestrator_close_ema_fallback_counts[key] = n_fallbacks
+                        age_ms = max(0, now_ms - prev_ts)
+                        logging.warning(
+                            "[ema] close EMA fallback %s span=%.8g ema=%.12g age_ms=%d"
+                            " n_fallbacks=%d reason=%s",
+                            symbol,
+                            span,
+                            prev_val,
+                            age_ms,
+                            n_fallbacks,
+                            reason,
+                        )
+                        continue
+                missing.append((span, reason))
+            if missing:
+                detail = "; ".join([f"span={sp:.8g} reason={why}" for sp, why in missing])
+                raise RuntimeError(
+                    f"[ema] missing required close EMA for {symbol}; no previous EMA fallback available: {detail}"
+                )
             return out
 
         async def ema_close(symbol: str, span: float) -> float:
-            return float(await self.cm.get_latest_ema_close(symbol, span=span, max_age_ms=30_000))
+            # 1m candles finalize once/min; 60s TTL avoids redundant network fetches.
+            return float(await self.cm.get_latest_ema_close(symbol, span=span, max_age_ms=60_000))
 
         async def ema_qv(symbol: str, span: float) -> float:
             return float(
@@ -4339,30 +4724,49 @@ class Passivbot:
                 await self.cm.get_latest_ema_log_range(symbol, span=span, tf="1h", max_age_ms=600_000)
             )
 
-        close_tasks = {
-            sym: asyncio.create_task(fetch_map(sym, sorted(need_close_spans[sym]), ema_close))
-            for sym in symbols
-        }
-        h1_lr_tasks = {
-            sym: asyncio.create_task(fetch_map(sym, sorted(need_h1_lr_spans[sym]), ema_lr_1h))
-            for sym in symbols
-        }
-        vol_tasks = {
-            sym: asyncio.create_task(fetch_map(sym, m1_volume_spans, ema_qv)) for sym in symbols
-        }
-        lr1m_tasks = {
-            sym: asyncio.create_task(fetch_map(sym, m1_lr_spans, ema_lr_1m)) for sym in symbols
-        }
+        async def load_symbol_bundle(sym: str):
+            close = await fetch_close_map(sym, sorted(need_close_spans[sym]))
+            h1 = await fetch_required_map(
+                sym, sorted(need_h1_lr_spans[sym]), ema_lr_1h, "h1_log_range"
+            )
+            vol = await fetch_map(sym, m1_volume_spans, ema_qv, "m1_volume")
+            lr1m = await fetch_map(sym, m1_lr_spans, ema_lr_1m, "m1_log_range")
+            return close, vol, lr1m, h1
+
+        # Ordering: symbols with open positions first (they need EMA data
+        # for correct order calculation), remaining symbols shuffled to
+        # avoid alphabetic starvation.
+        symbols_with_pos = [s for s in symbols if self.has_position(symbol=s)]
+        symbols_without_pos = [s for s in symbols if s not in symbols_with_pos]
+        random.shuffle(symbols_without_pos)
+        ordered_symbols = symbols_with_pos + symbols_without_pos
+
+        symbol_tasks = [asyncio.create_task(load_symbol_bundle(sym)) for sym in ordered_symbols]
+        symbol_results = await asyncio.gather(*symbol_tasks, return_exceptions=True)
 
         m1_close_emas: dict[str, dict[float, float]] = {}
         m1_volume_emas: dict[str, dict[float, float]] = {}
         m1_log_range_emas: dict[str, dict[float, float]] = {}
         h1_log_range_emas: dict[str, dict[float, float]] = {}
-        for sym in symbols:
-            m1_close_emas[sym] = await close_tasks[sym]
-            h1_log_range_emas[sym] = await h1_lr_tasks[sym]
-            m1_volume_emas[sym] = await vol_tasks[sym]
-            m1_log_range_emas[sym] = await lr1m_tasks[sym]
+        errors: list[tuple[str, Exception]] = []
+        for sym, res in zip(ordered_symbols, symbol_results):
+            if isinstance(res, Exception):
+                errors.append((sym, res))
+                continue
+            close, vol, lr1m, h1 = res
+            m1_close_emas[sym] = close
+            m1_volume_emas[sym] = vol
+            m1_log_range_emas[sym] = lr1m
+            h1_log_range_emas[sym] = h1
+        if errors:
+            for sym, err in errors[1:]:
+                logging.debug(
+                    "[ema] additional symbol EMA bundle failure %s: %s: %s",
+                    sym,
+                    type(err).__name__,
+                    err,
+                )
+            raise errors[0][1]
 
         # Convenience: compute the single-span values used by legacy forager logging.
         volumes_long = {s: m1_volume_emas[s].get(vol_span_long, 0.0) for s in symbols}
@@ -4384,7 +4788,52 @@ class Passivbot:
         if not symbols:
             return ({}, None) if return_snapshot else {}
 
-        last_prices = await self.cm.get_last_prices(symbols, max_age_ms=10_000)
+        # Get latest prices: prefer bulk allMids (1 API call for all symbols)
+        # over per-symbol get_current_close (N API calls). Falls back to CM if unavailable.
+        last_prices = {}
+        try:
+            if (
+                hasattr(self, "cca")
+                and self.cca is not None
+                and self.exchange
+                and self.exchange.lower() == "hyperliquid"
+            ):
+                # Call allMids directly – much cheaper than fetch_tickers which tries
+                # to map ALL coins (including unmapped HIP-3 @NNN IDs → warning spam).
+                fetched = await self.cca.fetch(
+                    self._hl_info_url(),
+                    method="POST",
+                    headers={"Content-Type": "application/json"},
+                    body=json.dumps({"type": "allMids"}),
+                )
+                # Build reverse map: coin_name → symbol (e.g. "BTC" → "BTC/USDC:USDC")
+                coin_to_sym = {v: k for k, v in self.symbol_ids.items()} if self.symbol_ids else {}
+                for coin, mid_str in fetched.items():
+                    sym = coin_to_sym.get(coin)
+                    if sym and sym in symbols:
+                        try:
+                            last_prices[sym] = float(mid_str)
+                        except (ValueError, TypeError):
+                            pass
+            elif hasattr(self, "fetch_tickers"):
+                tickers = await self.fetch_tickers()
+                for sym in symbols:
+                    tick = tickers.get(sym)
+                    if tick and tick.get("last") is not None:
+                        last_prices[sym] = float(tick["last"])
+            # Feed prices into CM cache so downstream EMA/close lookups hit cache
+            if last_prices:
+                now_ms = int(utc_ms())
+                for sym, price in last_prices.items():
+                    self.cm.set_current_close(sym, price, now_ms)
+        except Exception as e:
+            logging.debug("bulk price fetch failed, falling back to CM: %s", e)
+            last_prices = {}
+        # Fill any symbols still missing via CandlestickManager (individual fetches)
+        missing = [s for s in symbols if s not in last_prices or last_prices[s] <= 0.0]
+        if missing:
+            cm_prices = await self.cm.get_last_prices(missing, max_age_ms=10_000)
+            last_prices.update(cm_prices)
 
         # Ensure effective min cost is up to date.
         if not hasattr(self, "effective_min_cost") or not self.effective_min_cost:
@@ -4402,6 +4851,8 @@ class Passivbot:
         unstuck_allowances = self._calc_unstuck_allowances_live(
             allow_new_unstuck=not self.has_open_unstuck_order()
         )
+        realized_pnl_cumsum = self._get_realized_pnl_cumsum_stats()
+        max_realized_loss_pct = float(self.live_value("max_realized_loss_pct") or 1.0)
 
         global_bp = {
             "long": self._bot_params_to_rust_dict("long", None),
@@ -4411,11 +4862,15 @@ class Passivbot:
         # If either is False, we block same-coin hedging in the orchestrator.
         effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
         input_dict = {
-            "balance": float(self.balance),
+            "balance": self.get_hysteresis_snapped_balance(),
+            "balance_raw": self.get_raw_balance(),
             "global": {
                 "filter_by_min_effective_cost": bool(self.live_value("filter_by_min_effective_cost")),
                 "unstuck_allowance_long": float(unstuck_allowances.get("long", 0.0)),
                 "unstuck_allowance_short": float(unstuck_allowances.get("short", 0.0)),
+                "max_realized_loss_pct": max_realized_loss_pct,
+                "realized_pnl_cumsum_max": float(realized_pnl_cumsum.get("max", 0.0) or 0.0),
+                "realized_pnl_cumsum_last": float(realized_pnl_cumsum.get("last", 0.0) or 0.0),
                 "sort_global": True,
                 "global_bot_params": global_bp,
                 "hedge_mode": effective_hedge_mode,
@@ -4513,6 +4968,7 @@ class Passivbot:
                         logging.error("[ema] Missing EMA for %s (symbol_idx=%d)", symbol, idx)
             raise
         out = json.loads(out_json)
+        self._log_realized_loss_gate_blocks(out, idx_to_symbol)
         orders = out.get("orders", [])
 
         ideal_orders: dict[str, list] = {}
@@ -4545,7 +5001,13 @@ class Passivbot:
                     allowance = unstuck_allowances.get(pside, 0.0)
                     logging.info(
                         "[unstuck] selecting %s %s | entry=%.2f now=%.2f (%s%.1f%%) | allowance=%.2f",
-                        coin, pside, entry_price, current_price, sign, price_diff_pct, allowance
+                        coin,
+                        pside,
+                        entry_price,
+                        current_price,
+                        sign,
+                        price_diff_pct,
+                        allowance,
                     )
                 break  # Only one unstuck order per cycle
 
@@ -4561,6 +5023,7 @@ class Passivbot:
                 "exchange": str(getattr(self, "exchange", "")),
                 "user": str(self.config_get(["live", "user"]) or ""),
                 "active_symbols": list(symbols),
+                "realized_pnl_cumsum": realized_pnl_cumsum,
                 "orchestrator_input": input_dict,
                 "orchestrator_output": out,
             }
@@ -5131,6 +5594,29 @@ class Passivbot:
         self._forager_refresh_state = state
         return max(0, budget)
 
+    def _split_forager_budget_by_side(
+        self, total_budget: int, sides: Iterable[str]
+    ) -> Dict[str, int]:
+        """Split a cycle budget fairly across sides with round-robin remainder."""
+        side_list = [s for s in sides if s in ("long", "short")]
+        out = {s: 0 for s in side_list}
+        try:
+            total = int(total_budget)
+        except Exception:
+            total = 0
+        if total <= 0 or not side_list:
+            return out
+        n = len(side_list)
+        base = total // n
+        rem = total % n
+        for s in side_list:
+            out[s] = base
+        start = int(getattr(self, "_forager_budget_rr", 0) or 0) % n
+        for i in range(rem):
+            out[side_list[(start + i) % n]] += 1
+        self._forager_budget_rr = (start + 1) % n
+        return out
+
     def _forager_target_staleness_ms(self, n_symbols: int, max_calls_per_minute: int) -> int:
         """Compute max acceptable staleness for forager candidates based on refresh budget."""
         try:
@@ -5234,7 +5720,13 @@ class Passivbot:
             return
 
         if slots_open_any:
-            budget = len(all_candidates)
+            if max_calls > 0:
+                # Respect rate limit even with open slots; use token bucket budget.
+                budget = self._forager_refresh_budget(max_calls)
+                if budget <= 0:
+                    return
+            else:
+                budget = len(all_candidates)
         else:
             if max_calls <= 0:
                 return
@@ -5248,9 +5740,12 @@ class Passivbot:
         if not candidates:
             return
 
-        target_age_ms = 60_000 if slots_open_any else self._forager_target_staleness_ms(
-            len(all_candidates), max_calls
-        )
+        if slots_open_any:
+            rate_limit_age_ms = self._forager_target_staleness_ms(len(all_candidates), max_calls)
+            # Respect rate limit even with open slots; floor at 60s for responsiveness.
+            target_age_ms = max(60_000, rate_limit_age_ms) if max_calls > 0 else 60_000
+        else:
+            target_age_ms = self._forager_target_staleness_ms(len(all_candidates), max_calls)
         now = utc_ms()
         stale: List[Tuple[float, str]] = []
         for sym in candidates:
@@ -5301,10 +5796,14 @@ class Passivbot:
         except Exception:
             warmup_ratio = 0.0
         try:
-            max_warmup_minutes = int(get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0)
+            max_warmup_minutes = int(
+                get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0
+            )
         except Exception:
             max_warmup_minutes = 0
         span_buffer = 1.0 + max(0.0, warmup_ratio)
+
+        fetch_delay_s = self._get_fetch_delay_seconds()
 
         for sym in to_refresh:
             try:
@@ -5342,6 +5841,8 @@ class Passivbot:
                     strict=False,
                     max_lookback_candles=win,
                 )
+                if fetch_delay_s > 0:
+                    await asyncio.sleep(fetch_delay_s)
             except TimeoutError as exc:
                 logging.warning(
                     "Timed out acquiring candle lock for %s; forager refresh will retry (%s)",
@@ -5349,18 +5850,18 @@ class Passivbot:
                     exc,
                 )
             except Exception as exc:
-                logging.error(
-                    "error refreshing forager candles for %s: %s", sym, exc, exc_info=True
-                )
+                logging.error("error refreshing forager candles for %s: %s", sym, exc, exc_info=True)
 
     async def update_ohlcvs_1m_for_actives(self):
-        """Ensure active symbols have fresh 1m candles in CandlestickManager (<=10s old).
+        """Ensure active symbols have fresh 1m candles in CandlestickManager (<=60s old).
 
-        Uses CandlestickManager.get_candles with max_age_ms=10_000 so it refreshes
+        Uses CandlestickManager.get_candles with max_age_ms=60_000 so it refreshes
         only when its internal last refresh is older than the TTL. Fetches a small
         recent window ending at the latest finalized minute.
         """
-        max_age_ms = 10_000
+        # 1m candles only finalize once per minute; refreshing more often wastes API budget.
+        # Use 60s TTL so each symbol is fetched at most once per minute.
+        max_age_ms = 60_000
         try:
             now = utc_ms()
             end_ts = (now // ONE_MIN_MS) * ONE_MIN_MS - ONE_MIN_MS
@@ -5371,7 +5872,16 @@ class Passivbot:
                 window = 120
             start_ts = end_ts - ONE_MIN_MS * window
 
+            fetch_delay_s = self._get_fetch_delay_seconds()
+
             symbols = sorted(set(self.active_symbols))
+            # Prioritize symbols with open positions (need fresh candles for
+            # correct order calculation), shuffle the rest to avoid alphabetic
+            # starvation when a 429 forces cache-only for late symbols.
+            symbols_with_pos = [s for s in symbols if self.has_position(symbol=s)]
+            symbols_without_pos = [s for s in symbols if s not in symbols_with_pos]
+            random.shuffle(symbols_without_pos)
+            ordered_symbols = symbols_with_pos + symbols_without_pos
             self._maybe_log_candle_refresh(
                 "active refresh",
                 symbols,
@@ -5379,7 +5889,14 @@ class Passivbot:
                 refreshed=len(symbols),
                 throttle_ms=60_000,
             )
-            for sym in symbols:
+            for sym in ordered_symbols:
+                # If a 429 triggered a global backoff in the CandlestickManager,
+                # stop the loop early; remaining symbols would all hit the same
+                # backoff.  They will be picked up on the next cycle; the
+                # position-first + shuffle ordering prevents systematic starvation.
+                if self.cm.is_rate_limited():
+                    logging.debug("[candle] active refresh breaking early: rate limit backoff active")
+                    break
                 try:
                     await self.cm.get_candles(
                         sym,
@@ -5389,6 +5906,8 @@ class Passivbot:
                         strict=False,
                         max_lookback_candles=window,
                     )
+                    if fetch_delay_s > 0:
+                        await asyncio.sleep(fetch_delay_s)
                 except TimeoutError as exc:
                     logging.warning(
                         "Timed out acquiring candle lock for %s; will retry next cycle (%s)",
@@ -5420,8 +5939,10 @@ class Passivbot:
                 last_candle_check = int(getattr(self, "_candle_disk_check_last_ms", 0) or 0)
                 boot_delay_ms = int(getattr(self, "candle_disk_check_boot_delay_ms", 300_000) or 0)
                 boot_elapsed = int(now - getattr(self, "start_time_ms", now))
-                if candle_check_interval > 0 and boot_elapsed >= boot_delay_ms and (
-                    last_candle_check == 0 or now - last_candle_check >= candle_check_interval
+                if (
+                    candle_check_interval > 0
+                    and boot_elapsed >= boot_delay_ms
+                    and (last_candle_check == 0 or now - last_candle_check >= candle_check_interval)
                 ):
                     self._candle_disk_check_last_ms = now
                     try:
@@ -5432,7 +5953,14 @@ class Passivbot:
                         )
                 # update markets dict once every hour
                 if now - self.init_markets_last_update_ms > 1000 * 60 * 60:
-                    await self.init_markets(verbose=False)
+                    try:
+                        await self.init_markets(verbose=False)
+                    except RateLimitExceeded:
+                        self._health_rate_limits += 1
+                        logging.warning(
+                            "[rate] hourly init_markets hit rate limit; will retry next cycle"
+                        )
+                        await asyncio.sleep(10)
                 await asyncio.sleep(1)
             except Exception as e:
                 logging.error(f"error with {get_function_name()} {e}")
@@ -5461,10 +5989,14 @@ class Passivbot:
         eligible_symbols: Optional[Iterable[str]] = None,
         *,
         max_age_ms: Optional[int] = 60_000,
+        max_network_fetches: Optional[int] = None,
     ) -> Dict[str, float]:
         """Compute 1m EMA of log range per symbol: EMA(ln(high/low)).
 
         Returns mapping symbol -> ema_log_range; non-finite/failed computations yield 0.0.
+
+        If *max_network_fetches* is set, at most that many symbols will be allowed to
+        trigger a network fetch; the rest use cached data only.
         """
         if eligible_symbols is None:
             eligible_symbols = self.eligible_symbols
@@ -5474,7 +6006,9 @@ class Passivbot:
         except Exception:
             warmup_ratio = 0.0
         try:
-            max_warmup_minutes = int(get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0)
+            max_warmup_minutes = int(
+                get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0
+            )
         except Exception:
             max_warmup_minutes = 0
         span_buffer = 1.0 + max(0.0, warmup_ratio)
@@ -5482,23 +6016,33 @@ class Passivbot:
         if max_warmup_minutes > 0:
             window_candles = min(int(window_candles), int(max_warmup_minutes))
 
+        syms = list(eligible_symbols)
+
+        per_sym_ttl, cache_only_never_fetched = self._compute_fetch_budget_ttls(
+            syms, max_age_ms, max_network_fetches
+        )
+
         # Compute EMA of log range on 1m candles: ln(high/low)
         async def one(symbol: str):
             try:
-                # If caller passes a TTL, use it; otherwise select per-symbol TTL
-                if max_age_ms is not None:
-                    ttl = int(max_age_ms)
-                else:
-                    # More generous TTL for non-traded symbols
-                    has_pos = self.has_position(symbol)
-                    has_oo = (
-                        bool(self.open_orders.get(symbol)) if hasattr(self, "open_orders") else False
-                    )
-                    ttl = (
-                        60_000
-                        if (has_pos or has_oo)
-                        else int(getattr(self, "inactive_coin_candle_ttl_ms", 600_000))
-                    )
+                if symbol in cache_only_never_fetched:
+                    return 0.0
+                ttl = per_sym_ttl.get(symbol)
+                if ttl is None or ttl == 0:
+                    # If caller passes a TTL, use it; otherwise select per-symbol TTL
+                    if max_age_ms is not None:
+                        ttl = int(max_age_ms)
+                    else:
+                        # More generous TTL for non-traded symbols
+                        has_pos = self.has_position(symbol)
+                        has_oo = (
+                            bool(self.open_orders.get(symbol)) if hasattr(self, "open_orders") else False
+                        )
+                        ttl = (
+                            60_000
+                            if (has_pos or has_oo)
+                            else int(getattr(self, "inactive_coin_candle_ttl_ms", 600_000))
+                        )
                 res = await self.cm.get_latest_ema_metrics(
                     symbol,
                     {"log_range": span},
@@ -5511,7 +6055,6 @@ class Passivbot:
             except Exception:
                 return 0.0
 
-        syms = list(eligible_symbols)
         tasks = {s: asyncio.create_task(one(s)) for s in syms}
         out = {}
         n = len(syms)
@@ -5563,7 +6106,9 @@ class Passivbot:
         except Exception:
             warmup_ratio = 0.0
         try:
-            max_warmup_minutes = int(get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0)
+            max_warmup_minutes = int(
+                get_optional_live_value(self.config, "max_warmup_minutes", 0) or 0
+            )
         except Exception:
             max_warmup_minutes = 0
         span_buffer = 1.0 + max(0.0, warmup_ratio)
@@ -5845,7 +6390,10 @@ class Passivbot:
                                 stock_syms.add(sym)
                     if stock_syms:
                         coins = sorted(
-                            {symbol_to_coin(s) or (s.split("/")[0] if "/" in s else s) for s in stock_syms}
+                            {
+                                symbol_to_coin(s) or (s.split("/")[0] if "/" in s else s)
+                                for s in stock_syms
+                            }
                         )
                         logging.warning(
                             "Stock perps detected in approved_coins (%s). HIP-3 stock perps support is experimental/WIP.",

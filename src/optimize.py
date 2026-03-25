@@ -227,7 +227,10 @@ def _maybe_aggregate_backtest_data(hlcvs, timestamps, btc_usd_prices, mss, confi
     )
     logging.debug(
         "[optimize] aggregated %dm candles: %d bars -> %d bars (trimmed %d for alignment)",
-        candle_interval, n_before, hlcvs.shape[0], offset_bars,
+        candle_interval,
+        n_before,
+        hlcvs.shape[0],
+        offset_bars,
     )
     meta = mss.setdefault("__meta__", {})
     meta["data_interval_minutes"] = candle_interval
@@ -1218,6 +1221,11 @@ class SuiteEvaluator:
         aggregate_stats = aggregate_summary.get("stats", {})
 
         flat_stats = flatten_metric_stats(aggregate_stats)
+        # Override _mean with correctly aggregated values so calc_fitness
+        # respects the aggregate config (e.g. "max" instead of "mean").
+        aggregated_values = aggregate_summary.get("aggregated", {})
+        for metric, agg_value in aggregated_values.items():
+            flat_stats[f"{metric}_mean"] = agg_value
         objectives, total_penalty = self.base.calc_fitness(flat_stats)
         objectives_map = {f"w_{i}": val for i, val in enumerate(objectives)}
 
@@ -1548,6 +1556,7 @@ async def main():
                 total_shm_gb = total_shm_bytes / (1024**3)
                 try:
                     import shutil
+
                     if hasattr(os, "sysconf"):
                         pages = os.sysconf("SC_PHYS_PAGES")
                         page_size = os.sysconf("SC_PAGE_SIZE")

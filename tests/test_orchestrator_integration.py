@@ -16,7 +16,6 @@ import json
 import math
 import pytest
 
-
 # ============================================================================
 # Helper Functions (from test_orchestrator_json_api.py)
 # ============================================================================
@@ -191,6 +190,7 @@ def make_input(*, balance: float, global_bp=None, symbols):
     """Create orchestrator input."""
     return {
         "balance": balance,
+        "balance_raw": balance,
         "global": {
             "filter_by_min_effective_cost": False,
             "unstuck_allowance_long": 0.0,
