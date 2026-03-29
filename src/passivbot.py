@@ -1989,12 +1989,31 @@ class Passivbot:
         last_position_changes = self.get_last_position_changes()
         symbols = set(self.trailing_prices) | set(last_position_changes) | set(self.active_symbols)
 
+        # Check for freshly initialized trailing data (within last 60 seconds)
+        # These should not be overwritten to avoid seconds-open-seconds-close
+        fresh_inits = getattr(self, '_trailing_fresh_init', {})
+        now_ms = utc_ms()
+        skip_symbols_psides = {
+            key for key, ts in fresh_inits.items() 
+            if now_ms - ts < 10000  # 10 seconds protection window
+        }
+
         # Initialize containers for all symbols first
+        # But preserve freshly initialized values (avoid SOSOC)
         for symbol in symbols:
-            self.trailing_prices[symbol] = {
-                "long": _trailing_bundle_default_dict(),
-                "short": _trailing_bundle_default_dict(),
-            }
+            for pside in ["long", "short"]:
+                key = f"{symbol}_{pside}"
+                if key in skip_symbols_psides:
+                    # Preserve freshly initialized value
+                    if symbol not in self.trailing_prices:
+                        self.trailing_prices[symbol] = {}
+                    if pside not in self.trailing_prices[symbol]:
+                        self.trailing_prices[symbol][pside] = _trailing_bundle_default_dict()
+                else:
+                    # Reset to default
+                    if symbol not in self.trailing_prices:
+                        self.trailing_prices[symbol] = {}
+                    self.trailing_prices[symbol][pside] = _trailing_bundle_default_dict()
 
         # Build concurrent fetches per symbol that has position changes
         fetch_plan = {}
@@ -2029,6 +2048,11 @@ class Passivbot:
                 continue
             arr = np.sort(arr, order="ts")
             for pside, changed_ts in last_position_changes[symbol].items():
+                # Skip if this symbol/pside was freshly initialized (avoid SOSOC)
+                key = f"{symbol}_{pside}"
+                if key in skip_symbols_psides:
+                    logging.debug("[trailing] Skipping update for %s %s (fresh init)", symbol, pside)
+                    continue
                 mask = arr["ts"] > int(changed_ts)
                 if not np.any(mask):
                     continue
@@ -3114,6 +3138,7 @@ class Passivbot:
                 if oo["id"] not in oo_ids_new
             ]
             schedule_update_positions = False
+            filled_symbols_psides = []  # Track symbols/psides that were filled
             if len(removed_orders) > 20:
                 logging.info(f"removed {len(removed_orders)} orders")
             else:
@@ -3126,6 +3151,8 @@ class Passivbot:
                         self.log_order_action(
                             order, "missing order", "fetch_open_orders", level=logging.INFO
                         )
+                        # Track fill for trailing data reset
+                        filled_symbols_psides.append((order.get("symbol"), order.get("position_side")))
                     else:
                         self.log_order_action(
                             order, "removed order", "fetch_open_orders", level=logging.DEBUG
@@ -3143,8 +3170,41 @@ class Passivbot:
                     self.open_orders[elm["symbol"]] = []
                 self.open_orders[elm["symbol"]].append(elm)
             if schedule_update_positions:
+                # Reset trailing price data for filled positions to avoid stale data
+                # causing immediate close (seconds-open-seconds-close issue)
+                # First update positions to get the actual entry price
                 await asyncio.sleep(1.5)
                 await self.update_positions_and_balance()
+                for symbol, pside in filled_symbols_psides:
+                    if symbol and pside:
+                        if not hasattr(self, 'trailing_prices'):
+                            self.trailing_prices = {}
+                        if symbol not in self.trailing_prices:
+                            self.trailing_prices[symbol] = {}
+                        # Use actual position entry price to initialize trailing bundle
+                        # This prevents using stale data or wrong price levels
+                        pos = self.positions.get(symbol, {}).get(pside, {"size": 0.0, "price": 0.0})
+                        entry_price = float(pos.get("price", 0.0))
+                        if entry_price > 0:
+                            self.trailing_prices[symbol][pside] = {
+                                'min_since_open': entry_price,
+                                'max_since_min': entry_price,
+                                'max_since_open': entry_price,
+                                'min_since_max': entry_price,
+                            }
+                            # Mark as freshly initialized to prevent immediate overwrite
+                            if not hasattr(self, '_trailing_fresh_init'):
+                                self._trailing_fresh_init = {}
+                            self._trailing_fresh_init[f"{symbol}_{pside}"] = utc_ms()
+                            logging.info(
+                                f"[trailing] Init {symbol} {pside} on fill @ entry {entry_price:.4f}"
+                            )
+                        else:
+                            # Fallback to defaults if position not yet available
+                            self.trailing_prices[symbol][pside] = _trailing_bundle_default_dict()
+                            logging.info(
+                                f"[trailing] Reset {symbol} {pside} on fill (no position yet)"
+                            )
             return True
         except RateLimitExceeded:
             self._health_rate_limits += 1
