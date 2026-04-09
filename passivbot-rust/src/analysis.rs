@@ -9,6 +9,117 @@ fn fallback_timestamp_ms(index: usize) -> u64 {
     (index as u64) * 60_000
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct EquitySeriesMetrics {
+    pub gain: f64,
+    pub adg: f64,
+    pub mdg: f64,
+    pub sharpe_ratio: f64,
+    pub sortino_ratio: f64,
+    pub omega_ratio: f64,
+    pub expected_shortfall_1pct: f64,
+}
+
+pub fn analyze_equity_series(equities: &[f64], timestamps_ms: &[u64]) -> EquitySeriesMetrics {
+    if equities.len() < 2 {
+        return EquitySeriesMetrics::default();
+    }
+    let mut daily_eqs = Vec::new();
+    let mut daily_eqs_mins = Vec::new();
+
+    let use_timestamps = !timestamps_ms.is_empty() && timestamps_ms.len() == equities.len();
+    let mut current_day = if use_timestamps {
+        (timestamps_ms[0] / MS_PER_DAY) as usize
+    } else {
+        0
+    };
+    let mut current_min = equities[0];
+    let mut last_equity = equities[0];
+    for (i, &equity) in equities.iter().enumerate() {
+        let day = if use_timestamps {
+            (timestamps_ms[i] / MS_PER_DAY) as usize
+        } else {
+            i / 1440
+        };
+        if day > current_day {
+            daily_eqs.push(last_equity);
+            daily_eqs_mins.push(current_min);
+            current_day = day;
+            current_min = equity;
+        } else {
+            current_min = current_min.min(equity);
+        }
+        last_equity = equity;
+    }
+    daily_eqs.push(last_equity);
+    daily_eqs_mins.push(current_min);
+
+    let daily_eqs_pct_change: Vec<f64> = daily_eqs
+        .windows(2)
+        .map(|w| {
+            let denom = w[0].abs().max(1e-12);
+            (w[1] - w[0]) / denom
+        })
+        .collect();
+    let daily_eqs_mins_pct_change: Vec<f64> = daily_eqs_mins
+        .windows(2)
+        .map(|w| {
+            let denom = w[0].abs().max(1e-12);
+            (w[1] - w[0]) / denom
+        })
+        .collect();
+
+    let (gain, adg) = smoothed_terminal_geometric_gain_and_adg(&daily_eqs);
+    let mdg = median(&daily_eqs_pct_change);
+    let (sharpe_ratio, sortino_ratio) = calc_sharpe_and_sortino(&daily_eqs_mins_pct_change, adg);
+    let (gains_sum, losses_sum) =
+        daily_eqs_pct_change
+            .iter()
+            .fold((0.0, 0.0), |(gains, losses), &ret| {
+                if ret >= 0.0 {
+                    (gains + ret, losses)
+                } else {
+                    (gains, losses + ret.abs())
+                }
+            });
+    let omega_ratio = if losses_sum != 0.0 {
+        gains_sum / losses_sum
+    } else {
+        f64::INFINITY
+    };
+    let expected_shortfall_1pct = mean_worst_1pct_abs(&daily_eqs_mins_pct_change);
+    EquitySeriesMetrics {
+        gain,
+        adg,
+        mdg,
+        sharpe_ratio,
+        sortino_ratio,
+        omega_ratio,
+        expected_shortfall_1pct,
+    }
+}
+
+fn mean_worst_1pct_abs(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_by(|a, b| {
+        a.partial_cmp(b).unwrap_or_else(|| {
+            if a.is_nan() && b.is_nan() {
+                Ordering::Equal
+            } else if a.is_nan() {
+                Ordering::Greater
+            } else {
+                Ordering::Less
+            }
+        })
+    });
+    let cutoff_index = (sorted.len() as f64 * 0.01).max(1.0) as usize;
+    let worst_n = cutoff_index.min(sorted.len());
+    sorted[..worst_n].iter().map(|x| x.abs()).sum::<f64>() / worst_n as f64
+}
+
 fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>, timestamps_ms: &[u64]) -> Analysis {
     if fills.len() <= 1 {
         return Analysis::default();
@@ -283,6 +394,33 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>, timestamps_ms: &[
         total_loss / total_profit
     };
 
+    let (long_profit, long_loss, short_profit, short_loss) =
+        fills
+            .iter()
+            .fold((0.0, 0.0, 0.0, 0.0), |(lp, ll, sp, sl), fill| {
+                if fill.order_type.is_long() {
+                    if fill.pnl > 0.0 {
+                        (lp + fill.pnl, ll, sp, sl)
+                    } else {
+                        (lp, ll + fill.pnl.abs(), sp, sl)
+                    }
+                } else if fill.pnl > 0.0 {
+                    (lp, ll, sp + fill.pnl, sl)
+                } else {
+                    (lp, ll, sp, sl + fill.pnl.abs())
+                }
+            });
+    let loss_profit_ratio_long = if long_profit == 0.0 {
+        1.0
+    } else {
+        long_loss / long_profit
+    };
+    let loss_profit_ratio_short = if short_profit == 0.0 {
+        1.0
+    } else {
+        short_loss / short_profit
+    };
+
     // Calculate position durations and position_unchanged_hours_max
     let mut positions_opened: HashMap<String, u64> = HashMap::new(); // Tracks position open time
     let mut durations_ms: Vec<u64> = Vec::new(); // Total position durations (ms)
@@ -425,6 +563,8 @@ fn analyze_backtest_basic(fills: &[Fill], equities: &Vec<f64>, timestamps_ms: &[
     analysis.equity_balance_diff_pos_max = equity_balance_diff_pos_max;
     analysis.equity_balance_diff_pos_mean = equity_balance_diff_pos_mean;
     analysis.loss_profit_ratio = loss_profit_ratio;
+    analysis.loss_profit_ratio_long = loss_profit_ratio_long;
+    analysis.loss_profit_ratio_short = loss_profit_ratio_short;
     analysis.positions_held_per_day = positions_held_per_day;
     analysis.position_held_hours_mean = position_held_hours_mean;
     analysis.position_held_hours_max = position_held_hours_max;
@@ -688,22 +828,37 @@ pub fn analyze_backtest(
 }
 
 /// Returns (Analysis in USD, Analysis in BTC).
-/// If `balance.use_btc_collateral == false`, both are identical.
+/// BTC analysis is always computed from BTC-denominated balances/equity, even when the
+/// backtest never allocates collateral to BTC.
 pub fn analyze_backtest_pair(
     fills: &[Fill],
     equities: &Equities,
-    use_btc_collateral: bool,
+    _use_btc_collateral: bool,
     total_wallet_exposures: &[f64],
 ) -> (Analysis, Analysis) {
+    let (long_pnl_sum, short_pnl_sum) =
+        fills
+            .iter()
+            .fold((0.0, 0.0), |(long_sum, short_sum), fill| {
+                if fill.order_type.is_long() {
+                    (long_sum + fill.pnl, short_sum)
+                } else {
+                    (long_sum, short_sum + fill.pnl)
+                }
+            });
+    let pnl_sum = long_pnl_sum + short_pnl_sum;
+    let long_short_profit_ratio = if pnl_sum != 0.0 {
+        long_pnl_sum / pnl_sum
+    } else {
+        0.5
+    };
+
     let analysis_usd = analyze_backtest(
         fills,
         &equities.usd_total_equity,
         &equities.timestamps_ms,
         total_wallet_exposures,
     );
-    if !use_btc_collateral {
-        return (analysis_usd.clone(), analysis_usd);
-    }
     let mut btc_fills = fills.to_vec();
     for fill in btc_fills.iter_mut() {
         let price = if fill.btc_price > 0.0 {
@@ -723,6 +878,14 @@ pub fn analyze_backtest_pair(
         &equities.timestamps_ms,
         total_wallet_exposures,
     );
+    let mut analysis_usd = analysis_usd;
+    analysis_usd.pnl_ratio_long_short = long_short_profit_ratio;
+    analysis_usd.long_short_profit_ratio = long_short_profit_ratio;
+
+    let mut analysis_btc = analysis_btc;
+    analysis_btc.pnl_ratio_long_short = long_short_profit_ratio;
+    analysis_btc.long_short_profit_ratio = long_short_profit_ratio;
+
     (analysis_usd, analysis_btc)
 }
 
@@ -979,7 +1142,7 @@ pub fn calc_exponential_fit_error(equity: &[f64]) -> f64 {
     mse
 }
 
-/// Applies EMA smoothing (span=3) to daily equity values and computes geometric mean growth rate
+/// Computes terminal gain from the mean of the last up to 3 daily equity values and derives ADG.
 pub fn smoothed_terminal_geometric_gain_and_adg(daily_eqs: &[f64]) -> (f64, f64) {
     if daily_eqs.len() < 2 {
         return (0.0, 0.0);
@@ -987,17 +1150,9 @@ pub fn smoothed_terminal_geometric_gain_and_adg(daily_eqs: &[f64]) -> (f64, f64)
     if daily_eqs[0] <= 0.0 {
         return (f64::INFINITY, f64::INFINITY);
     }
-    let alpha = 2.0 / (3.0 + 1.0); // span = 3 → alpha = 0.5
-    let mut smoothed = Vec::with_capacity(daily_eqs.len());
-    smoothed.push(daily_eqs[0]);
-    for i in 1..daily_eqs.len() {
-        let prev = *smoothed.last().unwrap();
-        let current = alpha * daily_eqs[i] + (1.0 - alpha) * prev;
-        smoothed.push(current);
-    }
-
-    let start = smoothed[0];
-    let end = *smoothed.last().unwrap();
+    let start = daily_eqs[0];
+    let tail_len = daily_eqs.len().min(3);
+    let end = daily_eqs[daily_eqs.len() - tail_len..].iter().sum::<f64>() / tail_len as f64;
     if end <= 0.0 {
         return (-1.0, -1.0);
     }
@@ -1056,6 +1211,7 @@ mod tests {
             position_size: -0.1,
             position_price: 50000.0,
             order_type: OrderType::EntryInitialNormalShort,
+            liquidity: "maker".to_string(),
             wallet_exposure: twe_net.abs(),
             twe_long: 0.0,
             twe_short: twe_net,
@@ -1176,6 +1332,39 @@ mod tests {
             (analysis.peak_recovery_hours_pnl - 2.0).abs() < 1e-9,
             "Expected gross pnl recovery of 2.0h, got {}",
             analysis.peak_recovery_hours_pnl
+        );
+    }
+
+    #[test]
+    fn test_smoothed_terminal_geometric_gain_uses_last_three_day_mean() {
+        let daily_eqs = vec![100.0, 110.0, 120.0, 90.0];
+        let (gain, adg) = smoothed_terminal_geometric_gain_and_adg(&daily_eqs);
+        let expected_end: f64 = (110.0 + 120.0 + 90.0) / 3.0;
+        let expected_gain: f64 = expected_end / 100.0;
+        let expected_adg = expected_gain.powf(1.0 / daily_eqs.len() as f64) - 1.0;
+
+        assert!((gain - expected_gain).abs() < 1e-12);
+        assert!((adg - expected_adg).abs() < 1e-12);
+    }
+
+    #[test]
+    fn test_analyze_backtest_pair_computes_btc_metrics_without_btc_collateral() {
+        let fills = vec![make_fill(0, -0.1), make_fill(1, -0.1)];
+        let equities = Equities {
+            timestamps_ms: vec![0, MS_PER_DAY],
+            usd_total_equity: vec![1000.0, 1100.0],
+            btc_total_equity: vec![0.1, 0.095],
+        };
+        let exposures_series: Vec<f64> = vec![];
+
+        let (analysis_usd, analysis_btc) =
+            analyze_backtest_pair(&fills, &equities, false, &exposures_series);
+
+        assert!(analysis_usd.adg > 0.0, "expected positive usd adg");
+        assert!(analysis_btc.adg < 0.0, "expected negative btc adg");
+        assert!(
+            (analysis_usd.adg - analysis_btc.adg).abs() > 1e-12,
+            "expected btc metrics to differ from usd metrics without btc collateral"
         );
     }
 }

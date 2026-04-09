@@ -1,12 +1,15 @@
 # Metrics reference
 
 This page documents the main backtest metrics exposed by `passivbot-rust`. Values may appear with
-`_usd`/`_btc` suffixes, depending on the denomination used for a run. Metrics without a suffix are
-currency-agnostic (e.g., position counts) or already expressed as percentages/ratios.
+`_usd`/`_btc` suffixes. `_usd` metrics are computed from USD-denominated balance/equity, while
+`_btc` metrics are computed from BTC-denominated balance/equity even when the backtest never holds
+BTC collateral. Metrics without a suffix are currency-agnostic (e.g., position counts) or already
+expressed as percentages/ratios.
 
 ## Core growth metrics
-- `gain`: Terminal equity divided by starting equity (after EMA smoothing of daily equity).
-- `adg`: Average daily gain derived from smoothed daily equity (`gain.powf(1 / n_days) - 1`).
+- `gain`: Terminal equity divided by starting equity, where terminal equity is the mean of the
+  last up to three daily equity values.
+- `adg`: Average daily gain derived from that smoothed terminal equity (`gain.powf(1 / n_days) - 1`).
 - `adg_w`: Mean of `adg` computed on the trailing 10% slices (full run, last half, last third, …).
 - `adg_pnl`: Collateral-agnostic daily PnL ratio. For each day, sum all `pnl` and divide by that
   day’s last recorded `usd_total_balance`, then average those daily ratios across the run.
@@ -38,6 +41,13 @@ and more stable across collateral caps.
 - `drawdown_worst`: Maximum absolute drawdown over the equity curve.
 - `drawdown_worst_mean_1pct`: Mean of the worst 1% daily drawdowns.
 - `expected_shortfall_1pct`: Average loss of the worst 1% daily min-equity returns.
+
+## HSL metrics
+- `hard_stop_triggers`: Absolute count of RED trigger events during the run.
+- `hard_stop_restarts`: Absolute count of cooldown restarts after RED halts.
+- `hard_stop_total_loss_pct`: Total panic-close loss as a fraction of starting balance.
+- `hard_stop_triggers_per_year`: `hard_stop_triggers / n_days * 365.25`.
+- `hard_stop_restarts_per_year`: `hard_stop_restarts / n_days * 365.25`.
 
 ## Exposure, volume, and timing
 - `total_wallet_exposure_max/mean/median`: Stats over recorded wallet exposure values.
