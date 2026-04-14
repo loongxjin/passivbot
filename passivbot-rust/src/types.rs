@@ -330,6 +330,10 @@ fn default_hsl_panic_close_order_type() -> String {
     "market".to_string()
 }
 
+fn default_entry_grid_inflation_enabled() -> bool {
+    true
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 pub struct ForagerScoreWeights {
@@ -384,6 +388,8 @@ pub struct BotParams {
     pub close_trailing_qty_pct: f64,
     pub close_trailing_threshold_pct: f64,
     pub entry_grid_double_down_factor: f64,
+    #[serde(default = "default_entry_grid_inflation_enabled")]
+    pub entry_grid_inflation_enabled: bool,
     pub entry_grid_spacing_volatility_weight: f64,
     pub entry_grid_spacing_we_weight: f64,
     pub entry_grid_spacing_pct: f64,
@@ -590,6 +596,7 @@ pub struct Analysis {
     pub adg: f64,
     pub mdg: f64,
     pub gain: f64,
+    pub liquidated: bool,
     pub adg_pnl: f64,
     pub mdg_pnl: f64,
     pub sharpe_ratio_pnl: f64,
@@ -630,6 +637,10 @@ pub struct Analysis {
     pub equity_balance_diff_neg_mean: f64,
     pub equity_balance_diff_pos_max: f64,
     pub equity_balance_diff_pos_mean: f64,
+    pub paper_loss_ratio: f64,
+    pub paper_loss_mean_ratio: f64,
+    pub exposure_ratio: f64,
+    pub exposure_mean_ratio: f64,
     pub loss_profit_ratio: f64,
     pub loss_profit_ratio_long: f64,
     pub loss_profit_ratio_short: f64,
@@ -651,6 +662,10 @@ pub struct Analysis {
     pub position_held_hours_max: f64,
     pub position_held_hours_median: f64,
     pub position_unchanged_hours_max: f64,
+    pub win_rate: f64,
+    pub trade_loss_max: f64,
+    pub trade_loss_mean: f64,
+    pub trade_loss_median: f64,
 
     pub adg_w: f64,
     pub adg_pnl_w: f64,
@@ -671,6 +686,11 @@ pub struct Analysis {
     pub calmar_ratio_w: f64,
     pub sterling_ratio_w: f64,
     pub loss_profit_ratio_w: f64,
+    pub win_rate_w: f64,
+    pub paper_loss_ratio_w: f64,
+    pub paper_loss_mean_ratio_w: f64,
+    pub exposure_ratio_w: f64,
+    pub exposure_mean_ratio_w: f64,
     pub volume_pct_per_day_avg: f64,
     pub volume_pct_per_day_avg_w: f64,
 
@@ -713,6 +733,7 @@ impl Default for Analysis {
             adg: 0.0,
             mdg: 0.0,
             gain: 0.0,
+            liquidated: false,
             adg_pnl: 0.0,
             mdg_pnl: 0.0,
             sharpe_ratio_pnl: 0.0,
@@ -753,6 +774,10 @@ impl Default for Analysis {
             equity_balance_diff_neg_mean: 1.0,
             equity_balance_diff_pos_max: 1.0,
             equity_balance_diff_pos_mean: 1.0,
+            paper_loss_ratio: 0.0,
+            paper_loss_mean_ratio: 0.0,
+            exposure_ratio: 0.0,
+            exposure_mean_ratio: 0.0,
             loss_profit_ratio: 1.0,
             loss_profit_ratio_long: 1.0,
             loss_profit_ratio_short: 1.0,
@@ -769,6 +794,10 @@ impl Default for Analysis {
             position_held_hours_max: 0.0,
             position_held_hours_median: 0.0,
             position_unchanged_hours_max: 0.0,
+            win_rate: 0.0,
+            trade_loss_max: 0.0,
+            trade_loss_mean: 0.0,
+            trade_loss_median: 0.0,
             adg_w: 0.0,
             adg_pnl_w: 0.0,
             mdg_pnl_w: 0.0,
@@ -788,6 +817,11 @@ impl Default for Analysis {
             calmar_ratio_w: 0.0,
             sterling_ratio_w: 0.0,
             loss_profit_ratio_w: 1.0,
+            win_rate_w: 0.0,
+            paper_loss_ratio_w: 0.0,
+            paper_loss_mean_ratio_w: 0.0,
+            exposure_ratio_w: 0.0,
+            exposure_mean_ratio_w: 0.0,
             equity_choppiness_w: 1.0,
             equity_jerkiness_w: 1.0,
             exponential_fit_error_w: 1.0,

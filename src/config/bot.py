@@ -3,7 +3,7 @@ import math
 from copy import deepcopy
 from typing import Optional
 
-from pure_funcs import sort_dict_keys
+from pure_funcs import sort_dict_keys, str2bool
 
 from .log_output import log_config_message
 from .migrations import apply_backward_compatibility_renames
@@ -28,6 +28,34 @@ FORAGER_CANONICAL_TO_INTERNAL_BOUND_KEYS = {
     "short_forager_volume_ema_span": "short_filter_volume_ema_span",
     "short_forager_volume_drop_pct": "short_filter_volume_drop_pct",
 }
+
+
+def validate_unstuck_ema_dist_value(value, *, path: str, pside: str) -> None:
+    try:
+        numeric = float(value)
+    except (TypeError, ValueError) as exc:
+        raise TypeError(f"{path} must be numeric") from exc
+    if not math.isfinite(numeric):
+        raise ValueError(f"{path} must be finite")
+    if pside == "long" and numeric <= -1.0:
+        raise ValueError(
+            f"{path} must be > -1.0; -1.0 disables auto unstuck by producing a non-positive "
+            f"EMA trigger price. Use -0.99 for near-always-on behavior."
+        )
+    if pside == "short" and numeric >= 1.0:
+        raise ValueError(
+            f"{path} must be < 1.0; 1.0 disables auto unstuck by producing a non-positive "
+            f"EMA trigger price. Use -0.99 for near-always-on behavior."
+        )
+
+
+def validate_bot_config(result: dict) -> None:
+    for pside in BOT_POSITION_SIDES:
+        validate_unstuck_ema_dist_value(
+            result["bot"][pside]["unstuck_ema_dist"],
+            path=f"bot.{pside}.unstuck_ema_dist",
+            pside=pside,
+        )
 
 def ensure_bot_defaults(
     result: dict, *, verbose: bool = True, tracker: Optional[object] = None
@@ -182,6 +210,19 @@ def normalize_forager_score_weights(weights: dict, *, path: str) -> dict:
     return {key: normalized[key] / total for key in ("volume", "ema_readiness", "volatility")}
 
 
+def forager_score_weights_are_normalized(
+    weights: dict,
+    *,
+    path: str,
+    abs_tol: float = 1e-12,
+) -> bool:
+    normalized = normalize_forager_score_weights(weights, path=path)
+    return all(
+        math.isclose(normalized[key], weights[key], rel_tol=0.0, abs_tol=abs_tol)
+        for key in ("volume", "ema_readiness", "volatility")
+    )
+
+
 def normalize_bot_forager_config(
     result: dict,
     *,
@@ -244,6 +285,111 @@ def normalize_position_counts(result: dict, *, tracker: Optional[object] = None)
         result["bot"][pside]["n_positions"] = rounded
 
 
+def normalize_entry_grid_inflation_flags(
+    result: dict,
+    *,
+    tracker: Optional[object] = None,
+) -> None:
+    def _normalize_bool_flag(raw_value, *, path: str) -> bool:
+        if isinstance(raw_value, bool):
+            return raw_value
+        if isinstance(raw_value, (int, float)) and raw_value in (0, 1):
+            return bool(raw_value)
+        if isinstance(raw_value, str):
+            return str2bool(raw_value)
+        raise TypeError(f"{path} must be a boolean, got {type(raw_value).__name__}")
+
+    for pside in BOT_POSITION_SIDES:
+        raw_value = result["bot"][pside].get("entry_grid_inflation_enabled", True)
+        normalized = _normalize_bool_flag(
+            raw_value, path=f"bot.{pside}.entry_grid_inflation_enabled"
+        )
+        if tracker is not None and raw_value != normalized:
+            tracker.update(["bot", pside, "entry_grid_inflation_enabled"], raw_value, normalized)
+        result["bot"][pside]["entry_grid_inflation_enabled"] = normalized
+
+def normalize_coin_override_entry_grid_inflation_flags(result: dict) -> None:
+    for coin, override in (result.get("coin_overrides") or {}).items():
+        if not isinstance(override, dict):
+            continue
+        override_bot = override.get("bot", {})
+        if not isinstance(override_bot, dict):
+            continue
+        for pside in BOT_POSITION_SIDES:
+            bot_cfg = override_bot.get(pside, {})
+            if not isinstance(bot_cfg, dict) or "entry_grid_inflation_enabled" not in bot_cfg:
+                continue
+            raw_value = bot_cfg["entry_grid_inflation_enabled"]
+            if isinstance(raw_value, bool):
+                normalized = raw_value
+            elif isinstance(raw_value, (int, float)) and raw_value in (0, 1):
+                normalized = bool(raw_value)
+            elif isinstance(raw_value, str):
+                normalized = str2bool(raw_value)
+            else:
+                raise TypeError(
+                    "coin_overrides."
+                    f"{coin}.bot.{pside}.entry_grid_inflation_enabled must be a boolean, got "
+                    f"{type(raw_value).__name__}"
+                )
+            bot_cfg["entry_grid_inflation_enabled"] = normalized
+
+
+def warn_on_deprecated_entry_grid_inflation(
+    result: dict,
+    *,
+    verbose: bool = True,
+) -> None:
+    enabled_paths = [
+        f"bot.{pside}.entry_grid_inflation_enabled"
+        for pside in BOT_POSITION_SIDES
+        if bool(result["bot"][pside].get("entry_grid_inflation_enabled", True))
+    ]
+    if not enabled_paths:
+        return
+    log_config_message(
+        verbose,
+        logging.WARNING,
+        "%s enabled: inflated grid re-entries remain on for backwards compatibility, "
+        "but this feature is scheduled for deprecation in a future version. Set the flag "
+        "to false to adopt the canonical cropped-only grid behavior now.",
+        ", ".join(enabled_paths),
+    )
+
+
+def warn_on_deprecated_coin_override_entry_grid_inflation(
+    result: dict,
+    *,
+    verbose: bool = True,
+) -> None:
+    enabled_paths = []
+    for coin, override in (result.get("coin_overrides") or {}).items():
+        if not isinstance(override, dict):
+            continue
+        override_bot = override.get("bot", {})
+        if not isinstance(override_bot, dict):
+            continue
+        for pside in BOT_POSITION_SIDES:
+            bot_cfg = override_bot.get(pside, {})
+            if not isinstance(bot_cfg, dict):
+                continue
+            if not bool(bot_cfg.get("entry_grid_inflation_enabled", False)):
+                continue
+            if bool(result.get("bot", {}).get(pside, {}).get("entry_grid_inflation_enabled", True)):
+                continue
+            enabled_paths.append(f"coin_overrides.{coin}.bot.{pside}.entry_grid_inflation_enabled")
+    if not enabled_paths:
+        return
+    log_config_message(
+        verbose,
+        logging.WARNING,
+        "%s enabled: inflated grid re-entries remain on for backwards compatibility, "
+        "but this feature is scheduled for deprecation in a future version. Set the flag "
+        "to false to adopt the canonical cropped-only grid behavior now.",
+        ", ".join(enabled_paths),
+    )
+
+
 def validate_forager_config(
     result: dict,
     *,
@@ -269,7 +415,10 @@ def validate_forager_config(
             bot_cfg["forager_score_weights"],
             path=f"bot.{pside}.forager_score_weights",
         )
-        if normalized != bot_cfg["forager_score_weights"]:
+        if not forager_score_weights_are_normalized(
+            bot_cfg["forager_score_weights"],
+            path=f"bot.{pside}.forager_score_weights",
+        ):
             raise ValueError(
                 f"bot.{pside}.forager_score_weights must be normalized before validation"
             )
@@ -325,6 +474,8 @@ def format_bot_config(
     )
     normalize_bot_forager_config(result, verbose=verbose, tracker=tracker)
     normalize_position_counts(result, tracker=tracker)
+    normalize_entry_grid_inflation_flags(result, tracker=tracker)
+    warn_on_deprecated_entry_grid_inflation(result, verbose=verbose)
     return sort_dict_keys(result["bot"])
 
 

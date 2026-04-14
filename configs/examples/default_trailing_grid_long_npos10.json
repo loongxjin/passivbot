@@ -1,4 +1,5 @@
 {
+    "config_version": "v7.9.0",
     "backtest": {
         "aggregate": {
             "default": "mean",
@@ -25,6 +26,7 @@
         "max_warmup_minutes": 0,
         "ohlcv_source_dir": null,
         "market_order_slippage_pct": 0.0005,
+        "visible_metrics": null,
         "scenarios": [
             {"label": "base"},
             {
@@ -86,6 +88,7 @@
             "ema_span_0": 770,
             "ema_span_1": 210,
             "entry_grid_double_down_factor": 0.73,
+            "entry_grid_inflation_enabled": true,
             "entry_grid_spacing_pct": 0.033,
             "entry_grid_spacing_volatility_weight": 2.4,
             "entry_grid_spacing_we_weight": 0.135,
@@ -133,6 +136,7 @@
             "ema_span_0": 100,
             "ema_span_1": 100,
             "entry_grid_double_down_factor": 0.5,
+            "entry_grid_inflation_enabled": true,
             "entry_grid_spacing_pct": 0.025,
             "entry_grid_spacing_volatility_weight": 1,
             "entry_grid_spacing_we_weight": 0,
@@ -180,7 +184,6 @@
         "balance_hysteresis_snap_pct": 0.01,
         "balance_override": null,
         "candle_lock_timeout_seconds": 10,
-        "empty_means_all_approved": false,
         "enable_archive_candle_fetch": false,
         "execution_delay_seconds": 2,
         "filter_by_min_effective_cost": true,
@@ -216,8 +219,13 @@
         "warmup_ratio": 0.3
     },
     "logging": {
+        "backup_count": 5,
+        "dir": "logs",
         "level": 1,
+        "max_bytes_mb": 10.0,
         "memory_snapshot_interval_minutes": 30,
+        "persist_to_file": true,
+        "rotation": false,
         "volume_refresh_info_threshold_seconds": 30
     },
     "monitor": {

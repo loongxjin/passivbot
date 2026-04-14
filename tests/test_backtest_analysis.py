@@ -19,6 +19,19 @@ def _make_analysis_entry(value):
         "position_held_hours_max",
         "position_held_hours_median",
         "position_unchanged_hours_max",
+        "win_rate",
+        "win_rate_w",
+        "trade_loss_max",
+        "trade_loss_mean",
+        "trade_loss_median",
+        "paper_loss_ratio",
+        "paper_loss_mean_ratio",
+        "exposure_ratio",
+        "exposure_mean_ratio",
+        "paper_loss_ratio_w",
+        "paper_loss_mean_ratio_w",
+        "exposure_ratio_w",
+        "exposure_mean_ratio_w",
         "loss_profit_ratio",
         "loss_profit_ratio_w",
         "volume_pct_per_day_avg",
@@ -108,6 +121,91 @@ def test_expand_analysis_includes_high_exposure_hours():
         assert result[f"high_exposure_hours_max_{side}"] == 0.5
 
 
+def test_expand_analysis_includes_trade_level_metrics():
+    analysis_usd = _make_analysis_entry(0.25)
+    analysis_btc = _make_analysis_entry(0.75)
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+
+    assert result["win_rate"] == 0.25
+    assert result["win_rate_w"] == 0.25
+    assert result["trade_loss_max"] == 0.25
+    assert result["trade_loss_mean"] == 0.25
+    assert result["trade_loss_median"] == 0.25
+    assert "win_rate_usd" not in result
+    assert "trade_loss_max_btc" not in result
+
+
+def test_expand_analysis_currency_suffixes_new_ratio_metrics():
+    analysis_usd = _make_analysis_entry(0.25)
+    analysis_btc = _make_analysis_entry(0.75)
+    config = {
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 1.0},
+        }
+    }
+
+    result = expand_analysis(
+        analysis_usd,
+        analysis_btc,
+        fills=np.empty((0, 0)),
+        equities_array=np.empty((0, 3)),
+        config=config,
+    )
+
+    for metric in (
+        "paper_loss_ratio",
+        "paper_loss_mean_ratio",
+        "exposure_ratio",
+        "exposure_mean_ratio",
+        "paper_loss_ratio_w",
+        "paper_loss_mean_ratio_w",
+        "exposure_ratio_w",
+        "exposure_mean_ratio_w",
+    ):
+        assert result[f"{metric}_usd"] == 0.25
+        assert result[f"{metric}_btc"] == 0.75
+        assert metric not in result
+
+
+def test_make_table_includes_trade_metrics():
+    table = plotting.make_table(
+        {
+            "exchange": "binance",
+            "market_type": "futures",
+            "symbol": "BTC/USDT:USDT",
+            "passivbot_mode": "recursive_grid",
+            "adg_n_subdivisions": 10,
+            "long": {"enabled": False},
+            "short": {"enabled": False},
+            "result": {
+                "n_days": 7.0,
+                "starting_balance": 1000.0,
+                "win_rate": 0.625,
+                "trade_loss_max": 0.015,
+            },
+        }
+    ).get_string()
+
+    assert "Win rate" in table
+    assert "62.5%" in table
+    assert "Worst trade loss" in table
+    assert "1.5%" in table
+
+
 def test_expand_analysis_deduplicates_hard_stop_metrics():
     analysis_usd = _make_analysis_entry(0.5)
     analysis_btc = _make_analysis_entry(0.5)
@@ -176,6 +274,30 @@ def test_process_forager_fills_handles_zero_pnl_division():
     assert analysis_appendix["loss_profit_ratio_long"] == 1.0
     assert analysis_appendix["loss_profit_ratio_short"] == 1.0
     assert analysis_appendix["pnl_ratio_long_short"] == 0.5
+
+
+def test_process_forager_fills_no_fills_keeps_datetime_index_for_resample():
+    """No-fill balance/equity joins should stay resample-safe on a DatetimeIndex."""
+    t0 = 1_740_000_000_000
+    equities_array = np.array(
+        [
+            [t0, 1000.0, 0.02],
+            [t0 + 3_600_000, 1000.5, 0.02],
+        ],
+        dtype=np.float64,
+    )
+
+    fdf, _analysis_appendix, bal_eq = process_forager_fills(
+        fills=[],
+        coins=[],
+        hlcvs=np.empty((0, 0), dtype=np.float64),
+        equities_array=equities_array,
+        balance_sample_divider=60,
+    )
+
+    assert fdf.empty
+    assert isinstance(bal_eq.index, pd.DatetimeIndex)
+    assert not bal_eq.empty
 
 
 def test_post_process_disable_plotting_skips_all_figure_generation(tmp_path, monkeypatch):
@@ -300,6 +422,68 @@ def test_post_process_disable_plotting_coin_fills_only(tmp_path, monkeypatch):
     )
 
     assert calls == {"balance": 1, "twe": 1, "pnl": 1, "save": 3, "coin": 0}
+
+
+def test_post_process_visible_metrics_filters_terminal_output_only(tmp_path, monkeypatch, capsys):
+    def _fake_process_forager_fills(*args, **kwargs):
+        fdf = pd.DataFrame(columns=["coin", "pnl"])
+        bal_eq = pd.DataFrame({"balance": [1000.0], "equity": [1000.0]})
+        return fdf, {}, bal_eq
+
+    monkeypatch.setattr(bt, "process_forager_fills", _fake_process_forager_fills)
+    monkeypatch.setattr(bt, "format_config", lambda config, verbose=False: config)
+    monkeypatch.setattr(bt, "strip_config_metadata", lambda config: config)
+    monkeypatch.setattr(
+        bt, "dump_config", lambda config, path: open(path, "w", encoding="utf-8").write("{}")
+    )
+    monkeypatch.setattr(bt, "create_forager_balance_figures", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "create_forager_twe_figure", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "create_forager_pnl_figure", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "save_figures", lambda *args, **kwargs: {})
+    monkeypatch.setattr(bt, "create_forager_coin_figures", lambda *args, **kwargs: {})
+
+    config = {
+        "disable_plotting": True,
+        "backtest": {
+            "balance_sample_divider": 60,
+            "coins": {"binance": ["BTC"]},
+            "visible_metrics": None,
+        },
+        "bot": {
+            "long": {"total_wallet_exposure_limit": 1.0},
+            "short": {"total_wallet_exposure_limit": 0.0},
+        },
+        "live": {},
+        "optimize": {
+            "scoring": ["adg"],
+            "limits": [{"metric": "loss_profit_ratio"}],
+        },
+    }
+
+    bt.post_process(
+        config=config,
+        hlcvs=np.zeros((1, 1, 3), dtype=np.float64),
+        fills=[],
+        equities_array=np.array([[1704067200000, 1000.0, 1000.0]], dtype=np.float64),
+        btc_usd_prices=np.array([]),
+        analysis={
+            "adg_usd": 0.01,
+            "adg_btc": 0.02,
+            "loss_profit_ratio": 0.5,
+            "peak_recovery_hours_hsl": 12.0,
+        },
+        results_path=str(tmp_path),
+        exchange="binance",
+    )
+
+    captured = capsys.readouterr().out
+    assert "Showing 3 of 4 metrics" in captured
+    assert "adg_usd" in captured
+    assert "adg_btc" in captured
+    assert "loss_profit_ratio" in captured
+    assert "peak_recovery_hours_hsl" not in captured
+    analysis_path = next(tmp_path.glob("*/analysis.json"))
+    assert "peak_recovery_hours_hsl" in analysis_path.read_text(encoding="utf-8")
 
 
 def test_parse_disabled_plot_groups_accepts_summary_alias_and_commas():

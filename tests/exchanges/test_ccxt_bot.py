@@ -50,6 +50,39 @@ class TestCCXTBotSessionCreation:
         assert config["privateKey"] == "0xDEF456"
         assert "apiKey" not in config  # Not provided
 
+    def test_build_ccxt_config_default_timeout(self):
+        """Should set a default timeout of 30 000 ms when user_info has no timeout."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.user_info = {
+            "exchange": "bybit",
+            "apiKey": "k",
+            "secret": "s",
+            "quote": "USDT",
+        }
+
+        config = bot._build_ccxt_config()
+
+        assert config["timeout"] == 30000
+
+    def test_build_ccxt_config_user_timeout_not_overridden(self):
+        """User-supplied timeout in user_info must take precedence over the default."""
+        from exchanges.ccxt_bot import CCXTBot
+
+        bot = CCXTBot.__new__(CCXTBot)
+        bot.user_info = {
+            "exchange": "bybit",
+            "apiKey": "k",
+            "secret": "s",
+            "quote": "USDT",
+            "timeout": 60000,
+        }
+
+        config = bot._build_ccxt_config()
+
+        assert config["timeout"] == 60000
+
 
 class TestCCXTBotFetchBalance:
     """Test CCXTBot balance fetching."""
@@ -76,8 +109,8 @@ class TestCCXTBotFetchBalance:
         assert balance == 1000.50
 
     @pytest.mark.asyncio
-    async def test_fetch_balance_returns_zero_when_missing(self):
-        """Should return 0 when quote currency not in balance."""
+    async def test_fetch_balance_raises_when_quote_missing(self):
+        """Should fail loudly when quote currency is missing from total balance."""
         from exchanges.ccxt_bot import CCXTBot
 
         # Use __new__ to bypass complex Passivbot initialization
@@ -91,9 +124,10 @@ class TestCCXTBotFetchBalance:
             }
         )
 
-        balance = await bot.fetch_balance()
-
-        assert balance == 0.0
+        with pytest.raises(
+            KeyError, match=r"testexchange: fetch_balance response missing total\['USDC'\]"
+        ):
+            await bot.fetch_balance()
 
 
 class TestCCXTBotFetchPositions:

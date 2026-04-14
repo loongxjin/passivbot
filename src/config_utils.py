@@ -44,6 +44,7 @@ from config.limits import (
 )
 from config.log_output import log_config_message
 from config.metrics import CURRENCY_METRICS, SHARED_METRICS
+from config.pnl_lookback import normalize_pnls_max_lookback_days_config_value
 from config.normalize import normalize_config
 from config.overrides import (
     apply_allowed_modifications as staged_apply_allowed_modifications,
@@ -70,6 +71,8 @@ from config.migrations import (
     build_base_config_from_flavor as build_migration_base_config_from_flavor,
     detect_flavor as detect_migration_flavor,
     migrate_btc_collateral_settings as migrate_btc_collateral_settings_v7,
+    migrate_config_version as migrate_config_version_v7,
+    migrate_empty_means_all_approved as migrate_empty_means_all_approved_v7,
     migrate_suite_to_scenarios as migrate_suite_to_scenarios_v7,
     rename_config_keys as rename_migration_config_keys,
 )
@@ -135,6 +138,171 @@ HSL_PSIDE_KEYS = (
     "hsl_panic_close_order_type",
     "hsl_tier_ratios",
 )
+FIELD_RUNTIME_RULES = {
+    "live.approved_coins": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Coin Selection",
+            "optimize": "Coin Selection",
+        },
+    },
+    "live.ignored_coins": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest"},
+        "cli_exposed_on": {"live", "backtest"},
+        "help_group": {
+            "backtest": "Coin Selection",
+        },
+    },
+    "live.minimum_coin_age_days": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Coin Selection",
+            "optimize": "Coin Selection",
+        },
+    },
+    "live.hedge_mode": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+    },
+    "live.market_orders_allowed": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+    },
+    "live.market_order_near_touch_threshold": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+    },
+    "live.max_realized_loss_pct": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+    },
+    "live.pnls_max_lookback_days": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+    },
+}
+
+OPTIMIZE_FIXED_BOT_RUNTIME_CLI_ARGS = {
+    "bot.long.entry_grid_inflation_enabled": {
+        "visible": ["--bot.long.entry_grid_inflation_enabled"],
+        "hidden": ["--bot_long_entry_grid_inflation_enabled"],
+        "type": str2bool,
+        "metavar": "Y/N",
+        "commands": {"optimize"},
+        "help": "Override bot.long.entry_grid_inflation_enabled for this optimize run.",
+    },
+    "bot.short.entry_grid_inflation_enabled": {
+        "visible": ["--bot.short.entry_grid_inflation_enabled"],
+        "hidden": ["--bot_short_entry_grid_inflation_enabled"],
+        "type": str2bool,
+        "metavar": "Y/N",
+        "commands": {"optimize"},
+        "help": "Override bot.short.entry_grid_inflation_enabled for this optimize run.",
+    },
+    "bot.long.hsl_enabled": {
+        "visible": ["--bot.long.hsl_enabled"],
+        "hidden": ["--bot_long_hsl_enabled"],
+        "type": str2bool,
+        "metavar": "Y/N",
+        "commands": {"optimize"},
+        "help": "Override bot.long.hsl_enabled for this optimize run.",
+    },
+    "bot.short.hsl_enabled": {
+        "visible": ["--bot.short.hsl_enabled"],
+        "hidden": ["--bot_short_hsl_enabled"],
+        "type": str2bool,
+        "metavar": "Y/N",
+        "commands": {"optimize"},
+        "help": "Override bot.short.hsl_enabled for this optimize run.",
+    },
+    "bot.long.hsl_orange_tier_mode": {
+        "visible": ["--bot.long.hsl_orange_tier_mode"],
+        "hidden": ["--bot_long_hsl_orange_tier_mode"],
+        "type": str,
+        "metavar": "VALUE",
+        "commands": {"optimize"},
+        "choices": ["manual", "panic", "graceful_stop", "tp_only", "tp_only_with_active_entry_cancellation"],
+        "help": "Override bot.long.hsl_orange_tier_mode for this optimize run.",
+    },
+    "bot.short.hsl_orange_tier_mode": {
+        "visible": ["--bot.short.hsl_orange_tier_mode"],
+        "hidden": ["--bot_short_hsl_orange_tier_mode"],
+        "type": str,
+        "metavar": "VALUE",
+        "commands": {"optimize"},
+        "choices": ["manual", "panic", "graceful_stop", "tp_only", "tp_only_with_active_entry_cancellation"],
+        "help": "Override bot.short.hsl_orange_tier_mode for this optimize run.",
+    },
+    "bot.long.hsl_panic_close_order_type": {
+        "visible": ["--bot.long.hsl_panic_close_order_type"],
+        "hidden": ["--bot_long_hsl_panic_close_order_type"],
+        "type": str,
+        "metavar": "VALUE",
+        "commands": {"optimize"},
+        "choices": ["limit", "market"],
+        "help": "Override bot.long.hsl_panic_close_order_type for this optimize run.",
+    },
+    "bot.short.hsl_panic_close_order_type": {
+        "visible": ["--bot.short.hsl_panic_close_order_type"],
+        "hidden": ["--bot_short_hsl_panic_close_order_type"],
+        "type": str,
+        "metavar": "VALUE",
+        "commands": {"optimize"},
+        "choices": ["limit", "market"],
+        "help": "Override bot.short.hsl_panic_close_order_type for this optimize run.",
+    },
+}
+
+
+def get_field_runtime_rule(full_name: str) -> dict:
+    return FIELD_RUNTIME_RULES.get(full_name, {})
+
+
+def field_cli_exposed_on(full_name: str, command: Optional[str]) -> bool:
+    if command is None:
+        return True
+    rule = get_field_runtime_rule(full_name)
+    return command in rule.get("cli_exposed_on", set())
+
+
+def field_cli_help_group(full_name: str, command: Optional[str]) -> Optional[str]:
+    if command is None:
+        return None
+    rule = get_field_runtime_rule(full_name)
+    help_group = rule.get("help_group", {})
+    if not isinstance(help_group, dict):
+        return None
+    return help_group.get(command)
 
 
 def load_hjson_config(config_path: str, *, log_errors: bool = True) -> dict:
@@ -245,6 +413,18 @@ def _migrate_btc_collateral_settings(
     result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
 ) -> None:
     migrate_btc_collateral_settings_v7(result, verbose=verbose, tracker=tracker)
+
+
+def _migrate_config_version(
+    result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
+) -> None:
+    migrate_config_version_v7(result, verbose=verbose, tracker=tracker)
+
+
+def _migrate_empty_means_all_approved(
+    result: dict, verbose: bool = True, tracker: Optional[ConfigTransformTracker] = None
+) -> None:
+    migrate_empty_means_all_approved_v7(result, verbose=verbose, tracker=tracker)
 
 
 def detect_flavor(config: dict, template: dict) -> str:
@@ -557,8 +737,9 @@ RESERVED_CLI_ARGS = {
             "optimize": "Coin Selection",
         },
         "help": (
-            "Approved coins. Comma-separated coins like BTC,ETH,XRP, or path to a JSON "
-            "coin list file. Use coin tickers, not exchange symbols."
+            "Approved coins. Use CSV like BTC,ETH,XRP, the literal 'all', a path to a JSON "
+            "coin list file, or a JSON/HJSON per-side object like "
+            "{\"long\":[\"BTC\"],\"short\":\"all\"}. Use coin tickers, not exchange symbols."
         ),
     },
     "live.ignored_coins": {
@@ -578,9 +759,10 @@ RESERVED_CLI_ARGS = {
         "hidden": ["--live.minimum_coin_age_days", "--live_minimum_coin_age_days"],
         "type": float,
         "metavar": "FLOAT",
-        "commands": {"live", "optimize"},
+        "commands": {"live", "backtest", "optimize"},
         "group": {
             "live": "Coin Selection",
+            "backtest": "Coin Selection",
             "optimize": "Coin Selection",
         },
         "help": "Minimum coin age in days required before a coin is eligible to trade.",
@@ -602,8 +784,12 @@ RESERVED_CLI_ARGS = {
         "hidden": ["--live.hedge_mode", "--live_hedge_mode"],
         "type": str2bool,
         "metavar": "Y/N",
-        "commands": {"live", "optimize"},
-        "group": {"live": "Behavior"},
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
         "help": (
             "Enable or disable hedge mode. If the exchange does not support simultaneous "
             "long and short on the same coin, the bot will use hedge_mode=false."
@@ -623,27 +809,55 @@ RESERVED_CLI_ARGS = {
         "hidden": ["--live.market_orders_allowed", "--live_market_orders_allowed"],
         "type": str2bool,
         "metavar": "Y/N",
-        "commands": {"live"},
-        "group": {"live": "Behavior"},
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
         "help": "Allow or disallow market orders.",
+    },
+    "live.market_order_near_touch_threshold": {
+        "visible": ["--market-order-near-touch-threshold", "-montt"],
+        "hidden": [
+            "--live.market_order_near_touch_threshold",
+            "--live_market_order_near_touch_threshold",
+        ],
+        "type": float,
+        "metavar": "FLOAT",
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+        "help": "Distance threshold for allowing market orders near touch.",
     },
     "live.max_realized_loss_pct": {
         "visible": ["--max-realized-loss-pct", "-mrlp"],
         "hidden": ["--live.max_realized_loss_pct", "--live_max_realized_loss_pct"],
         "type": float,
         "metavar": "FLOAT",
-        "commands": {"live", "optimize"},
-        "group": {"live": "Behavior"},
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
         "help": "Maximum realized loss percentage allowed before trading is halted.",
     },
     "live.pnls_max_lookback_days": {
         "visible": ["--pnls-max-lookback-days", "-pmld"],
         "hidden": ["--live.pnls_max_lookback_days", "--live_pnls_max_lookback_days"],
-        "type": float,
-        "metavar": "FLOAT",
-        "commands": {"live"},
-        "group": {"live": "Behavior"},
-        "help": "How far into the past to fetch realized PnL history, in days.",
+        "type": normalize_pnls_max_lookback_days_config_value,
+        "metavar": "FLOAT|all",
+        "commands": {"live", "backtest", "optimize"},
+        "group": {
+            "live": "Behavior",
+            "backtest": "Backtest Runtime",
+            "optimize": "Backtest Runtime",
+        },
+        "help": "How far into the past to fetch realized PnL history: 0=minimal lookback, positive=float days, 'all'=full history.",
     },
     "live.price_distance_threshold": {
         "visible": ["--price-distance-threshold", "-pdt"],
@@ -806,6 +1020,28 @@ RESERVED_CLI_ARGS = {
     },
 }
 
+RESERVED_CLI_ARGS.update(OPTIMIZE_FIXED_BOT_RUNTIME_CLI_ARGS)
+
+
+def _merge_runtime_rules_into_reserved_cli_args():
+    for full_name, rule in FIELD_RUNTIME_RULES.items():
+        spec = RESERVED_CLI_ARGS.get(full_name)
+        if spec is None:
+            continue
+
+        cli_exposed_on = rule.get("cli_exposed_on", set())
+        if cli_exposed_on:
+            spec["commands"] = set(spec.get("commands", set())) | set(cli_exposed_on)
+
+        help_group = rule.get("help_group", {})
+        if isinstance(help_group, dict) and help_group:
+            merged_group = dict(spec.get("group", {}))
+            merged_group.update(help_group)
+            spec["group"] = merged_group
+
+
+_merge_runtime_rules_into_reserved_cli_args()
+
 CLI_HELP_GROUPS = {
     "live": [
         "Coin Selection",
@@ -914,11 +1150,11 @@ def _classify_live_argument(full_name: str, help_all: bool) -> Optional[str]:
 
 
 def _classify_backtest_argument(full_name: str, help_all: bool) -> Optional[str]:
+    shared_group = field_cli_help_group(full_name, "backtest")
+    if shared_group is not None:
+        return shared_group
     coin_selection = {
         "backtest.exchanges",
-        "live.approved_coins",
-        "live.ignored_coins",
-        "live.minimum_coin_age_days",
     }
     date_range = {
         "backtest.end_date",
@@ -957,9 +1193,11 @@ def _classify_backtest_argument(full_name: str, help_all: bool) -> Optional[str]
 
 
 def _classify_optimize_argument(full_name: str, help_all: bool) -> Optional[str]:
+    shared_group = field_cli_help_group(full_name, "optimize")
+    if shared_group is not None:
+        return shared_group
     coin_selection = {
         "backtest.exchanges",
-        "live.approved_coins",
     }
     date_range = {
         "backtest.end_date",
@@ -1040,6 +1278,31 @@ def classify_config_argument(
     return None
 
 
+def project_template_config_for_cli(config: dict, command: Optional[str]) -> dict:
+    result = deepcopy(config)
+    if command == "backtest":
+        result.pop("optimize", None)
+        live_cfg = result.get("live")
+        if isinstance(live_cfg, dict):
+            result["live"] = {
+                key: live_cfg[key]
+                for key in sorted(live_cfg)
+                if field_cli_exposed_on(f"live.{key}", "backtest")
+            }
+        return result
+    if command == "optimize":
+        result.pop("bot", None)
+        live_cfg = result.get("live")
+        if isinstance(live_cfg, dict):
+            result["live"] = {
+                key: live_cfg[key]
+                for key in sorted(live_cfg)
+                if field_cli_exposed_on(f"live.{key}", "optimize")
+            }
+        return result
+    return result
+
+
 def add_reserved_arguments(
     parser,
     *,
@@ -1095,7 +1358,9 @@ def add_reserved_arguments(
     return reserved_acronyms, reserved_keys
 
 
-def add_config_arguments(parser, config, *, command: Optional[str] = None, help_all: bool = False, group_map=None):
+def add_config_arguments(
+    parser, config, *, command: Optional[str] = None, help_all: bool = False, group_map=None
+):
     """Add all CLI arguments for config parameters.
 
     This is the main entry point for adding config-based arguments.
@@ -1109,6 +1374,7 @@ def add_config_arguments(parser, config, *, command: Optional[str] = None, help_
     reserved_acronyms, reserved_keys = add_reserved_arguments(
         parser, command=command, help_all=help_all, group_map=group_map
     )
+    registered_keys = set(reserved_keys)
     add_arguments_recursively(
         parser,
         config,
@@ -1118,7 +1384,9 @@ def add_config_arguments(parser, config, *, command: Optional[str] = None, help_
         command=command,
         help_all=help_all,
         group_map=group_map,
+        registered_keys=registered_keys,
     )
+    return registered_keys
 
 
 def add_arguments_recursively(
@@ -1130,6 +1398,7 @@ def add_arguments_recursively(
     command: Optional[str] = None,
     help_all: bool = False,
     group_map=None,
+    registered_keys=None,
 ):
     """Recursively add CLI arguments for config parameters.
 
@@ -1144,6 +1413,8 @@ def add_arguments_recursively(
         acronyms = set()
     if skip_keys is None:
         skip_keys = set()
+    if registered_keys is None:
+        registered_keys = set()
 
     for key in sorted(config):
         value = config[key]
@@ -1181,6 +1452,7 @@ def add_arguments_recursively(
                     ),
                 )
                 acronyms.add(acronym)
+                registered_keys.add(full_name)
                 continue
             add_arguments_recursively(
                 parser,
@@ -1191,6 +1463,7 @@ def add_arguments_recursively(
                 command=command,
                 help_all=help_all,
                 group_map=group_map,
+                registered_keys=registered_keys,
             )
             continue
         else:
@@ -1215,6 +1488,8 @@ def add_arguments_recursively(
                     type_ = str
             elif type_ == bool:
                 type_ = str2bool
+            elif full_name == "live.pnls_max_lookback_days":
+                type_ = normalize_pnls_max_lookback_days_config_value
             elif isinstance(value, (int, float)) and not isinstance(value, bool):
                 type_ = float
             if "combine_ohlcvs" in full_name:
@@ -1243,6 +1518,7 @@ def add_arguments_recursively(
                 ),
             )
             acronyms.add(acronym)
+            registered_keys.add(full_name)
 
 
 def recursive_config_update(config, key, value, path=None, verbose=False):
@@ -1262,35 +1538,59 @@ def recursive_config_update(config, key, value, path=None, verbose=False):
                 return float(new_value)
         return new_value
 
-    if key in config:
-        coerced_value = _coerce_value(config[key], value)
-        if coerced_value != config[key]:
-            full_path = ".".join(path + [key])
-            old_value = deepcopy(config[key])
-            message, args = _format_config_change_message(full_path, config[key], coerced_value)
-            _log_config(verbose, logging.INFO, message, *args)
-            config[key] = coerced_value
-            return {"path": full_path, "old": old_value, "new": deepcopy(coerced_value)}
-        return None
-
     key_split = key.split(".")
-    if key_split[0] in config:
-        new_path = path + [key_split[0]]
-        return recursive_config_update(
-            config[key_split[0]], ".".join(key_split[1:]), value, new_path, verbose=verbose
+    current_key = key_split[0]
+    full_path = ".".join(path + [current_key])
+
+    if len(key_split) == 1:
+        if current_key in config:
+            coerced_value = _coerce_value(config[current_key], value)
+            if coerced_value != config[current_key]:
+                old_value = deepcopy(config[current_key])
+                message, args = _format_config_change_message(
+                    full_path, config[current_key], coerced_value
+                )
+                _log_config(verbose, logging.INFO, message, *args)
+                config[current_key] = coerced_value
+                return {"path": full_path, "old": old_value, "new": deepcopy(coerced_value)}
+            return None
+        _log_config(verbose, logging.INFO, "added %s %s", full_path, value)
+        config[current_key] = deepcopy(value)
+        return {"path": full_path, "old": None, "new": deepcopy(value)}
+
+    if current_key not in config:
+        config[current_key] = {}
+    elif not isinstance(config[current_key], dict):
+        raise TypeError(
+            f"cannot apply nested config override {'.'.join(path + key_split)!r}: "
+            f"{full_path} is {type(config[current_key]).__name__}, expected dict"
         )
 
-    return None
+    return recursive_config_update(
+        config[current_key],
+        ".".join(key_split[1:]),
+        value,
+        path + [current_key],
+        verbose=verbose,
+    )
 
 
-def update_config_with_args(config, args, verbose=False):
+def update_config_with_args(config, args, verbose=False, allowed_keys: Optional[set[str]] = None):
     changed_keys = []
     diffs = []
     for key, value in vars(args).items():
         if value is None:
             continue
+        if allowed_keys is not None:
+            if key not in allowed_keys:
+                continue
+        elif "." not in key:
+            continue
         if key in {"live.approved_coins", "live.ignored_coins"}:
-            normalized = normalize_coins_source(value)
+            normalized = normalize_coins_source(
+                value,
+                allow_all=(key == "live.approved_coins"),
+            )
             change = recursive_config_update(config, key, normalized, verbose=verbose)
             source_key = key.split(".")[-1]
             config.setdefault("_coins_sources", {})[source_key] = deepcopy(normalized)

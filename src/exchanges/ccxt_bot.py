@@ -35,6 +35,7 @@ import asyncio
 import math
 import time
 import traceback
+from copy import deepcopy
 
 from passivbot import Passivbot, logging, custom_id_to_snake
 import ccxt.pro as ccxt_pro
@@ -198,6 +199,7 @@ class CCXTBot(Passivbot):
 
         config = {k: v for k, v in self.user_info.items() if k not in passivbot_fields}
         config["enableRateLimit"] = True
+        config.setdefault("timeout", 30000)  # 30 s — CCXT default ~10 s is too tight on cold boot
 
         # Remap legacy credential field names to CCXT-native names for backwards compatibility
         legacy_mappings = {
@@ -237,8 +239,9 @@ class CCXTBot(Passivbot):
         ccxt_config = self._build_ccxt_config()
         user_options = self.user_info.get("options", {})
 
-        # REST client
-        exchange_class = getattr(ccxt_async, self.exchange)
+        # REST client — prefer futures-specific id (e.g. binanceusdm) over generic name
+        ccxt_id = getattr(self, "exchange_ccxt_id", self.exchange)
+        exchange_class = getattr(ccxt_async, ccxt_id)
         self.cca = exchange_class(ccxt_config)
         self.cca.options.update(self._build_ccxt_options())
         self.cca.options.update(user_options)
@@ -247,7 +250,7 @@ class CCXTBot(Passivbot):
 
         # WebSocket client - optional, enables faster order updates
         if self.ws_enabled:
-            ws_class = getattr(ccxt_pro, self.exchange)
+            ws_class = getattr(ccxt_pro, ccxt_id)
             self.ccp = ws_class(ccxt_config)
             self.ccp.options.update(self._build_ccxt_options())
             self.ccp.options.update(user_options)
@@ -281,13 +284,19 @@ class CCXTBot(Passivbot):
         - _get_balance(): Extract balance value
 
         Returns:
-            float: Total balance in quote currency, or 0.0 if not found.
+            float: Total balance in quote currency.
 
         Raises:
-            Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
+            Exception: On API errors or missing required balance fields
+                (caller handles via restart_bot_on_too_many_errors).
         """
         fetched = await self._do_fetch_balance()
         return self._get_balance(fetched)
+
+    async def capture_balance_snapshot(self) -> tuple[dict, float]:
+        """Fetch balance once and derive normalized value from the same payload."""
+        fetched = await self._do_fetch_balance()
+        return fetched, self._get_balance(deepcopy(fetched))
 
     async def _do_fetch_balance(self) -> dict:
         """Hook: Call exchange API for balance.
@@ -308,7 +317,16 @@ class CCXTBot(Passivbot):
         Default: CCXT unified format total[quote]
         Override: Exchange-specific field paths (e.g., info.totalCrossWalletBalance)
         """
-        return float(fetched.get("total", {}).get(self.quote, 0))
+        total = fetched.get("total")
+        if not isinstance(total, dict):
+            raise KeyError(
+                f"{self.exchange}: fetch_balance response missing 'total' mapping for quote {self.quote}"
+            )
+        if self.quote not in total:
+            raise KeyError(
+                f"{self.exchange}: fetch_balance response missing total[{self.quote!r}]"
+            )
+        return float(total[self.quote])
 
     async def fetch_positions(self) -> list:
         """Template method: Fetch all open positions.
@@ -326,6 +344,11 @@ class CCXTBot(Passivbot):
         """
         fetched = await self._do_fetch_positions()
         return self._normalize_positions(fetched)
+
+    async def capture_positions_snapshot(self) -> tuple[list, list]:
+        """Fetch positions once and derive normalized positions from the same payload."""
+        fetched = await self._do_fetch_positions()
+        return fetched, self._normalize_positions(deepcopy(fetched))
 
     async def _do_fetch_positions(self) -> list:
         """Hook: Call exchange API for positions.
@@ -373,6 +396,27 @@ class CCXTBot(Passivbot):
         """
         return elm.get("side", "long").lower()
 
+    async def _do_fetch_open_orders(self, symbol: str = None) -> list:
+        """Hook: Call exchange API for open orders."""
+        exchange = getattr(self, "exchange", "unknown")
+        sym_str = symbol if symbol else "all symbols"
+        logging.debug(f"{exchange}: fetching open orders for {sym_str}")
+        t0 = time.time()
+        fetched = await self.cca.fetch_open_orders(symbol=symbol)
+        elapsed_ms = (time.time() - t0) * 1000
+        logging.debug(
+            f"{exchange}: fetch_open_orders completed in {elapsed_ms:.1f}ms, {len(fetched)} orders"
+        )
+        return fetched
+
+    def _normalize_open_orders(self, fetched: list) -> list:
+        """Hook: Transform raw open orders to passivbot format."""
+        for elm in fetched:
+            elm["position_side"] = self._get_position_side_for_order(elm)
+            elm["qty"] = elm["amount"]
+            self._record_live_margin_mode_from_payload(elm)
+        return sorted(fetched, key=lambda x: x["timestamp"])
+
     async def fetch_open_orders(self, symbol: str = None) -> list:
         """Fetch open orders, optionally filtered by symbol.
 
@@ -385,19 +429,13 @@ class CCXTBot(Passivbot):
         Raises:
             Exception: On API errors (caller handles via restart_bot_on_too_many_errors).
         """
-        sym_str = symbol if symbol else "all symbols"
-        logging.debug(f"{self.exchange}: fetching open orders for {sym_str}")
-        t0 = time.time()
-        fetched = await self.cca.fetch_open_orders(symbol=symbol)
-        elapsed_ms = (time.time() - t0) * 1000
-        logging.debug(
-            f"{self.exchange}: fetch_open_orders completed in {elapsed_ms:.1f}ms, {len(fetched)} orders"
-        )
-        for elm in fetched:
-            elm["position_side"] = self._get_position_side_for_order(elm)
-            elm["qty"] = elm["amount"]
-            self._record_live_margin_mode_from_payload(elm)
-        return sorted(fetched, key=lambda x: x["timestamp"])
+        fetched = await self._do_fetch_open_orders(symbol=symbol)
+        return self._normalize_open_orders(fetched)
+
+    async def capture_open_orders_snapshot(self, symbol: str = None) -> tuple[list, list]:
+        """Fetch open orders once and derive normalized orders from the same payload."""
+        fetched = await self._do_fetch_open_orders(symbol=symbol)
+        return fetched, self._normalize_open_orders(deepcopy(fetched))
 
     async def watch_orders(self):
         """Template method: Watch for order updates.

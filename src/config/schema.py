@@ -1,12 +1,14 @@
 from copy import deepcopy
 
 
+CONFIG_SCHEMA_VERSION = "v7.9.0"
 DEFAULT_EXAMPLE_CONFIG_PATH = "configs/examples/default_trailing_grid_long_npos10.json"
 
 
 def get_template_config():
     return deepcopy(
         {
+            "config_version": CONFIG_SCHEMA_VERSION,
             "backtest": {
                 "aggregate": {
                     "default": "mean",
@@ -33,6 +35,7 @@ def get_template_config():
                 "max_warmup_minutes": 0,
                 "ohlcv_source_dir": None,
                 "market_order_slippage_pct": 0.0005,
+                "visible_metrics": None,
                 "scenarios": [
                     {"label": "base"},
                     {
@@ -168,6 +171,7 @@ def get_template_config():
                     "ema_span_0": 770,
                     "ema_span_1": 210,
                     "entry_grid_double_down_factor": 0.73,
+                    "entry_grid_inflation_enabled": True,
                     "entry_grid_spacing_pct": 0.033,
                     "entry_grid_spacing_volatility_weight": 2.4,
                     "entry_grid_spacing_we_weight": 0.135,
@@ -219,6 +223,7 @@ def get_template_config():
                     "ema_span_0": 100,
                     "ema_span_1": 100,
                     "entry_grid_double_down_factor": 0.5,
+                    "entry_grid_inflation_enabled": True,
                     "entry_grid_spacing_pct": 0.025,
                     "entry_grid_spacing_volatility_weight": 1,
                     "entry_grid_spacing_we_weight": 0,
@@ -312,7 +317,6 @@ def get_template_config():
                 "balance_hysteresis_snap_pct": 0.01,
                 "balance_override": None,
                 "candle_lock_timeout_seconds": 10,
-                "empty_means_all_approved": False,
                 "enable_archive_candle_fetch": False,
                 "execution_delay_seconds": 2,
                 "filter_by_min_effective_cost": True,
@@ -348,8 +352,13 @@ def get_template_config():
                 "warmup_ratio": 0.3,
             },
             "logging": {
+                "backup_count": 5,
+                "dir": "logs",
                 "level": 1,
+                "max_bytes_mb": 10.0,
                 "memory_snapshot_interval_minutes": 30,
+                "persist_to_file": True,
+                "rotation": False,
                 "volume_refresh_info_threshold_seconds": 30,
             },
             "monitor": {

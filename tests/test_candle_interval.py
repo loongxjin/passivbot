@@ -139,6 +139,20 @@ def test_backtest_with_candle_interval():
     assert equities_array.shape[1] == 3
     assert equities_array.shape[0] <= n_minutes // 5
     assert np.isfinite(analysis["positions_held_per_day"])
+    assert analysis["liquidated"] is False
+    for key in [
+        "win_rate",
+        "win_rate_w",
+        "trade_loss_max",
+        "trade_loss_mean",
+        "trade_loss_median",
+        "paper_loss_ratio_usd",
+        "paper_loss_mean_ratio_usd",
+        "exposure_ratio_usd",
+        "exposure_mean_ratio_usd",
+    ]:
+        assert key in analysis
+        assert np.isfinite(analysis[key])
 
 
 def test_backtest_allows_hsl_ema_span_below_candle_interval():

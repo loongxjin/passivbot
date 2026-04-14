@@ -7,7 +7,7 @@ from tools.event_loop_policy import set_windows_event_loop_policy
 
 set_windows_event_loop_policy()
 
-from ccxt.base.errors import NetworkError, RateLimitExceeded
+from ccxt.base import errors as ccxt_errors
 import random
 import traceback
 import argparse
@@ -54,10 +54,12 @@ from config.coerce import (
     normalize_hsl_cooldown_position_policy,
     normalize_hsl_signal_mode,
 )
+from config.pnl_lookback import parse_pnls_max_lookback_days
 from config.overrides import parse_overrides
 from logging_setup import (
     configure_logging,
     get_last_log_activity_monotonic,
+    resolve_live_log_file_settings,
     resolve_log_level,
 )
 from utils import (
@@ -71,6 +73,7 @@ from utils import (
     filter_markets,
     to_ccxt_exchange_id,
     coin_symbol_warning_counts,
+    _coins_source_side_is_all,
     normalize_coins_source,
 )
 from prettytable import PrettyTable
@@ -102,8 +105,14 @@ from procedures import (
     print_async_exception,
 )
 from utils import get_file_mod_ms
-from downloader import compute_per_coin_warmup_minutes
+from warmup_utils import compute_per_coin_warmup_minutes
 import re
+
+NetworkError = ccxt_errors.NetworkError
+RateLimitExceeded = ccxt_errors.RateLimitExceeded
+# Some isolated tests stub ccxt.base.errors without RequestTimeout; treat it as a
+# NetworkError-class transient startup error when the dedicated symbol is absent.
+RequestTimeout = getattr(ccxt_errors, "RequestTimeout", NetworkError)
 
 # Orchestrator-only: ideal orders are computed via Rust orchestrator (JSON API).
 # Legacy Python order calculation paths are removed in this branch.
@@ -1011,14 +1020,11 @@ class Passivbot:
         config = getattr(self, "config", None)
         if config is None:
             return None
-        lookback_days_raw = float(require_live_value(config, "pnls_max_lookback_days"))
-        if not math.isfinite(lookback_days_raw):
-            raise ValueError("live.pnls_max_lookback_days must be finite for pnl lookback logic")
-        lookback_days = max(0.0, lookback_days_raw)
-        if lookback_days == 0.0:
-            return None
-        lookback_ms = max(1, int(round(lookback_days * 86_400_000.0)))
-        return self.get_exchange_time() - lookback_ms
+        lookback = parse_pnls_max_lookback_days(
+            require_live_value(config, "pnls_max_lookback_days"),
+            field_name="live.pnls_max_lookback_days",
+        )
+        return lookback.event_history_start_ms(self.get_exchange_time())
 
     def _get_effective_pnl_events(self) -> list:
         if self._pnls_manager is None:
@@ -1028,14 +1034,12 @@ class Passivbot:
             return self._pnls_manager.get_events()
         return self._pnls_manager.get_events(start_ms=start_ms)
 
-    def _equity_hard_stop_lookback_ms(self) -> int:
-        lookback_days_raw = float(require_live_value(self.config, "pnls_max_lookback_days"))
-        if not math.isfinite(lookback_days_raw):
-            raise ValueError(
-                "live.pnls_max_lookback_days must be finite for hard-stop rolling-peak logic"
-            )
-        lookback_days = max(0.0, lookback_days_raw)
-        return max(1, int(round(lookback_days * 86_400_000.0)))
+    def _equity_hard_stop_lookback_ms(self) -> Optional[int]:
+        lookback = parse_pnls_max_lookback_days(
+            require_live_value(self.config, "pnls_max_lookback_days"),
+            field_name="live.pnls_max_lookback_days",
+        )
+        return lookback.hsl_window_ms()
 
     def _equity_hard_stop_apply_sample(
         self,
@@ -1067,7 +1071,9 @@ class Passivbot:
         strategy_pnl = realized_pnl + unrealized_pnl
         peak_strategy_pnl = float(
             self._equity_hard_stop_strategy_pnl_peak.update(
-                int(timestamp_ms), float(strategy_pnl), int(lookback_ms)
+                int(timestamp_ms),
+                float(strategy_pnl),
+                int(lookback_ms) if lookback_ms is not None else (2**64 - 1),
             )
         )
         baseline_balance = balance - realized_pnl
@@ -2178,7 +2184,23 @@ class Passivbot:
         """Load exchange market metadata and refresh approval lists."""
         # called at bot startup and once an hour thereafter
         self.init_markets_last_update_ms = utc_ms()
-        await self.update_exchange_config()  # set hedge mode
+        # Retry on transient network errors (TCP + TLS handshake on a fresh
+        # aiohttp session can time out; also called hourly so transient errors
+        # should not abort the refresh cycle).
+        for _attempt in range(1, 4):
+            try:
+                await self.update_exchange_config()  # set hedge mode
+                break
+            except (RequestTimeout, NetworkError) as e:
+                if _attempt == 3:
+                    raise
+                logging.warning(
+                    "[init_markets] update_exchange_config error (attempt %d/3): %s – retrying in %ds",
+                    _attempt,
+                    e,
+                    5 * _attempt,
+                )
+                await asyncio.sleep(5 * _attempt)
         # Reuse existing ccxt session when available (ensures shared options such as fetchMarkets types).
         cc_instance = getattr(self, "cca", None)
         self.markets_dict = await load_markets(
@@ -3168,16 +3190,10 @@ class Passivbot:
         if not balance_ok:
             return False
 
-        # Build task list: open_orders and fill events (pnls)
-        tasks = [
+        open_orders_ok, pnls_ok = await asyncio.gather(
             self.update_open_orders(),
             self.update_pnls(),
-        ]
-
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        open_orders_ok = results[0] is True
-        pnls_ok = results[1] is True
+        )
 
         if not open_orders_ok or not pnls_ok:
             return False
@@ -3653,7 +3669,12 @@ class Passivbot:
         return per_sym_ttl, cache_only_never_fetched
 
     def _get_fetch_delay_seconds(self) -> float:
-        """Return configured per-fetch delay in seconds (default 0.2s for Hyperliquid)."""
+        """Return configured per-fetch delay in seconds.
+
+        Default 200ms for Bybit and Hyperliquid (strict IP-based rate limits),
+        0ms for all others.
+        Override via live.warmup_fetch_delay_ms in config.
+        """
         fetch_delay_ms = get_optional_live_value(self.config, "warmup_fetch_delay_ms", None)
         try:
             fetch_delay_ms = float(fetch_delay_ms) if fetch_delay_ms is not None else None
@@ -3661,7 +3682,7 @@ class Passivbot:
             fetch_delay_ms = None
         if fetch_delay_ms is None:
             exchange_lower = self.exchange.lower() if self.exchange else ""
-            fetch_delay_ms = 200.0 if exchange_lower == "hyperliquid" else 0.0
+            fetch_delay_ms = 200.0 if exchange_lower in ("bybit", "hyperliquid") else 0.0
         return max(0.0, float(fetch_delay_ms) / 1000.0)
 
     def stop_data_maintainers(self, verbose=True):
@@ -4621,9 +4642,11 @@ class Passivbot:
 
         try:
             # Use the same lookback window
-            age_limit = self.get_exchange_time() - 1000 * 60 * 60 * 24 * float(
-                self.live_value("pnls_max_lookback_days")
+            lookback = parse_pnls_max_lookback_days(
+                self.live_value("pnls_max_lookback_days"),
+                field_name="live.pnls_max_lookback_days",
             )
+            age_limit = lookback.fill_cache_age_limit_ms(self.get_exchange_time())
 
             # Get existing event IDs and source IDs before refresh
             existing_ids: set[str] = set()
@@ -4640,7 +4663,17 @@ class Passivbot:
             # Check if we need a full refresh (cache empty or too old)
             events = self._pnls_manager.get_events()
             needs_full_refresh = not events
-            if events:
+            history_scope = self._pnls_manager.get_history_scope()
+            if lookback.is_all and events and history_scope != "all":
+                needs_full_refresh = True
+                cache_key = "_fills_full_refresh_logged"
+                if not getattr(self, cache_key, False):
+                    setattr(self, cache_key, True)
+                    logging.debug(
+                        "[fills] Cache history scope %s is narrower than requested full history; doing full refresh",
+                        history_scope,
+                    )
+            elif events and age_limit is not None:
                 oldest_event_ts = events[0].timestamp
                 if oldest_event_ts > age_limit + 1000 * 60 * 60 * 24:  # > 1 day newer than limit
                     needs_full_refresh = True
@@ -4657,10 +4690,17 @@ class Passivbot:
             if needs_full_refresh:
                 # Full refresh with proper lookback window
                 if not getattr(self, "_fills_full_refresh_logged", False):
-                    logging.debug(
-                        "[fills] Performing full refresh from %s", ts_to_date(age_limit)[:19]
-                    )
-                await self._pnls_manager.refresh(start_ms=int(age_limit), end_ms=None)
+                    if age_limit is None:
+                        logging.debug("[fills] Performing full refresh from full available history")
+                    else:
+                        logging.debug(
+                            "[fills] Performing full refresh from %s", ts_to_date(age_limit)[:19]
+                        )
+                await self._pnls_manager.refresh(
+                    start_ms=None if age_limit is None else int(age_limit),
+                    end_ms=None,
+                )
+                self._pnls_manager.set_history_scope("all" if lookback.is_all else "window")
             else:
                 # Incremental refresh
                 await self._pnls_manager.refresh_latest(overlap=20)
@@ -4707,7 +4747,7 @@ class Passivbot:
             logging.error("[fills] Failed to update FillEventsManager: %s", e)
             if self.logging_level >= 2:
                 traceback.print_exc()
-            return False
+            raise
 
     # -------------------------------------------------------------------------
     # FillEventsManager Helpers
@@ -5059,7 +5099,10 @@ class Passivbot:
                     }
                 ],
                 "metadata": {
-                    "lookback_days": float(self.live_value("pnls_max_lookback_days")),
+                    "lookback_days": parse_pnls_max_lookback_days(
+                        self.live_value("pnls_max_lookback_days"),
+                        field_name="live.pnls_max_lookback_days",
+                    ).display_value,
                     "resolution_ms": ONE_MIN_MS,
                     "events_used": 0,
                     "symbols_covered": [],
@@ -5067,10 +5110,12 @@ class Passivbot:
                 },
             }
 
-        lookback_days = float(self.live_value("pnls_max_lookback_days"))
+        lookback = parse_pnls_max_lookback_days(
+            self.live_value("pnls_max_lookback_days"),
+            field_name="live.pnls_max_lookback_days",
+        )
         ts_now = self.get_exchange_time()
-        lookback_ms = max(lookback_days, 0.0) * 24 * 60 * 60 * 1000
-        lookback_start = ts_now - lookback_ms
+        lookback_start = lookback.balance_history_start_ms(ts_now)
 
         balance_now = (
             float(current_balance) if current_balance is not None else self.get_raw_balance()
@@ -5081,9 +5126,13 @@ class Passivbot:
         )
         baseline_balance = balance_now - total_realised
 
-        start_ts = min(ensure_millis(events[0]["timestamp"]), lookback_start)
+        if lookback_start is None:
+            start_ts = ensure_millis(events[0]["timestamp"])
+            record_start_minute = int(math.floor(start_ts / ONE_MIN_MS) * ONE_MIN_MS)
+        else:
+            start_ts = min(ensure_millis(events[0]["timestamp"]), lookback_start)
+            record_start_minute = int(math.floor(lookback_start / ONE_MIN_MS) * ONE_MIN_MS)
         start_minute = int(math.floor(start_ts / ONE_MIN_MS) * ONE_MIN_MS)
-        record_start_minute = int(math.floor(lookback_start / ONE_MIN_MS) * ONE_MIN_MS)
         end_minute = int(math.floor(ts_now / ONE_MIN_MS) * ONE_MIN_MS)
         if end_minute < record_start_minute:
             end_minute = record_start_minute
@@ -5336,7 +5385,7 @@ class Passivbot:
             for row in timeline
         ]
         metadata = {
-            "lookback_days": lookback_days,
+            "lookback_days": lookback.display_value,
             "resolution_ms": ONE_MIN_MS,
             "events_used": len(events),
             "symbols_covered": sorted(symbols),
@@ -5402,6 +5451,9 @@ class Passivbot:
                 if elm["symbol"] not in self.open_orders:
                     self.open_orders[elm["symbol"]] = []
                 self.open_orders[elm["symbol"]].append(elm)
+            balance_reconciled = self._reconcile_balance_after_open_orders_refresh()
+            if balance_reconciled:
+                await self.handle_balance_update(source="REST+open_orders")
             if schedule_update_positions:
                 await asyncio.sleep(1.5)
                 await self.update_positions_and_balance()
@@ -5414,7 +5466,7 @@ class Passivbot:
             logging.error(f"error with {get_function_name()} {e}")
             print_async_exception(res)
             traceback.print_exc()
-            return False
+            raise
 
     def get_exchange_time(self):
         """Return current exchange time in milliseconds."""
@@ -5624,6 +5676,8 @@ class Passivbot:
             self.balance_hysteresis_snap_pct = 0.02
         if not hasattr(self, "balance_raw"):
             self.balance_raw = self.get_raw_balance()
+        if not hasattr(self, "_exchange_reported_balance_raw"):
+            self._exchange_reported_balance_raw = self.balance_raw
 
         if self.balance_override is not None:
             balance_raw = float(self.balance_override)
@@ -5649,6 +5703,7 @@ class Passivbot:
             logging.warning("non-finite balance fetch result; keeping previous balance")
             return False
 
+        self._exchange_reported_balance_raw = balance_raw
         balance_snapped = balance_raw
         if self.balance_override is None:
             if self.previous_hysteresis_balance is None:
@@ -5660,6 +5715,14 @@ class Passivbot:
         self.balance_raw = balance_raw
         self.balance = balance_snapped
         return True
+
+    def _reconcile_balance_after_open_orders_refresh(self) -> bool:
+        """Exchange hook: adjust balance after fresh open-order state if needed."""
+        return False
+
+    def _reconcile_balance_after_positions_and_balance_refresh(self) -> bool:
+        """Exchange hook: adjust balance after fresh positions+balance state if needed."""
+        return False
 
     async def update_positions_and_balance(self):
         """Convenience helper to refresh both positions and balance concurrently."""
@@ -5680,6 +5743,7 @@ class Passivbot:
             except Exception as e:
                 logging.error(f"error logging position changes {e}")
         if balance_ok and positions_ok:
+            self._reconcile_balance_after_positions_and_balance_refresh()
             await self.handle_balance_update(source="REST")
         return balance_ok, positions_ok
 
@@ -5745,6 +5809,7 @@ class Passivbot:
             "close_trailing_qty_pct",
             "close_trailing_threshold_pct",
             "entry_grid_double_down_factor",
+            "entry_grid_inflation_enabled",
             "entry_grid_spacing_volatility_weight",
             "entry_grid_spacing_we_weight",
             "entry_grid_spacing_pct",
@@ -5776,7 +5841,7 @@ class Passivbot:
             "unstuck_loss_allowance_pct",
             "unstuck_threshold",
         ]
-        out: dict[str, float | int] = {}
+        out: dict[str, object] = {}
         for key in fields:
             if key in global_keys:
                 val = self.bot_value(pside, key)
@@ -5799,6 +5864,8 @@ class Passivbot:
                 }
             elif key == "n_positions":
                 out[out_key] = int(round(val or 0.0))
+            elif key == "entry_grid_inflation_enabled":
+                out[out_key] = bool(val)
             else:
                 out[out_key] = float(val or 0.0)
         out.update(
@@ -6398,8 +6465,27 @@ class Passivbot:
         random.shuffle(symbols_without_pos)
         ordered_symbols = symbols_with_pos + symbols_without_pos
 
-        symbol_tasks = [asyncio.create_task(load_symbol_bundle(sym)) for sym in ordered_symbols]
-        symbol_results = await asyncio.gather(*symbol_tasks, return_exceptions=True)
+        get_fetch_delay_seconds = getattr(self, "_get_fetch_delay_seconds", None)
+        if callable(get_fetch_delay_seconds):
+            fetch_delay_s = float(get_fetch_delay_seconds())
+        elif hasattr(self, "config") or hasattr(self, "exchange"):
+            fetch_delay_s = float(Passivbot._get_fetch_delay_seconds(self))
+        else:
+            fetch_delay_s = 0.0
+        if fetch_delay_s > 0:
+            # Strict exchanges benefit from pacing expensive 1h refreshes when
+            # all symbol TTLs expire at the same hour boundary.
+            symbol_results = []
+            for sym in ordered_symbols:
+                try:
+                    res = await load_symbol_bundle(sym)
+                except Exception as e:
+                    res = e
+                symbol_results.append(res)
+                await asyncio.sleep(fetch_delay_s)
+        else:
+            symbol_tasks = [asyncio.create_task(load_symbol_bundle(sym)) for sym in ordered_symbols]
+            symbol_results = await asyncio.gather(*symbol_tasks, return_exceptions=True)
 
         m1_close_emas: dict[str, dict[float, float]] = {}
         m1_volume_emas: dict[str, dict[float, float]] = {}
@@ -7623,7 +7709,10 @@ class Passivbot:
 
     async def maintain_hourly_cycle(self):
         """Periodically refresh market metadata while the bot is running."""
-        logging.info("[hourly] starting maintenance cycle")
+        # Random jitter (0–120s) so multiple bots on the same VPS don't fire
+        # init_markets simultaneously and blow through IP-based rate limits.
+        jitter_s = random.uniform(0, 120)
+        logging.info("[hourly] starting maintenance cycle (jitter=%.1fs)", jitter_s)
         while not self.stop_signal_received:
             try:
                 now = utc_ms()
@@ -7650,8 +7739,9 @@ class Passivbot:
                         logging.error(
                             "error running candle disk coverage audit: %s", exc, exc_info=True
                         )
-                # update markets dict once every hour
-                if now - self.init_markets_last_update_ms > 1000 * 60 * 60:
+                # update markets dict once every hour, with per-instance jitter
+                hourly_interval_ms = 1000 * 60 * 60 + int(jitter_s * 1000)
+                if now - self.init_markets_last_update_ms > hourly_interval_ms:
                     try:
                         await self.init_markets(verbose=False)
                     except RateLimitExceeded:
@@ -7942,44 +8032,47 @@ class Passivbot:
         for pside in content:
             if not psides_equal or symbols is None:
                 coins = content[pside]
-                # Check if coins is a single string that needs to be split
-                if isinstance(coins, str):
-                    coins = coins.split(",")
-                # Handle case where list contains comma-separated values in its elements
-                elif isinstance(coins, (list, tuple)):
-                    expanded_coins = []
-                    for item in coins:
-                        if isinstance(item, str) and "," in item:
-                            expanded_coins.extend(item.split(","))
-                        else:
-                            expanded_coins.append(item)
-                    coins = expanded_coins
+                if k_coins == "approved_coins" and _coins_source_side_is_all(coins):
+                    symbols = set(getattr(self, "eligible_symbols", set()))
+                else:
+                    # Check if coins is a single string that needs to be split
+                    if isinstance(coins, str):
+                        coins = coins.split(",")
+                    # Handle case where list contains comma-separated values in its elements
+                    elif isinstance(coins, (list, tuple)):
+                        expanded_coins = []
+                        for item in coins:
+                            if isinstance(item, str) and "," in item:
+                                expanded_coins.extend(item.split(","))
+                            else:
+                                expanded_coins.append(item)
+                        coins = expanded_coins
 
-                symbols = [self.coin_to_symbol(coin, verbose=False) for coin in coins if coin]
-                symbols = {s for s in symbols if s}
-                eligible = getattr(self, "eligible_symbols", None)
-                if eligible:
-                    skipped = [sym for sym in symbols if sym not in eligible]
-                    if skipped:
-                        coin_list = ", ".join(
-                            sorted(symbol_to_coin(sym, verbose=False) or sym for sym in skipped)
-                        )
-                        symbol_list = ", ".join(sorted(skipped))
-                        warned = getattr(self, "_unsupported_coin_warnings", None)
-                        if warned is None:
-                            warned = set()
-                            setattr(self, "_unsupported_coin_warnings", warned)
-                        warn_key = (self.exchange, coin_list, symbol_list, k_coins)
-                        if warn_key not in warned:
-                            logging.info(
-                                "[config] skipping unsupported markets for %s: coins=%s symbols=%s exchange=%s",
-                                k_coins,
-                                coin_list,
-                                symbol_list,
-                                getattr(self, "exchange", "?"),
+                    symbols = [self.coin_to_symbol(coin, verbose=False) for coin in coins if coin]
+                    symbols = {s for s in symbols if s}
+                    eligible = getattr(self, "eligible_symbols", None)
+                    if eligible:
+                        skipped = [sym for sym in symbols if sym not in eligible]
+                        if skipped:
+                            coin_list = ", ".join(
+                                sorted(symbol_to_coin(sym, verbose=False) or sym for sym in skipped)
                             )
-                            warned.add(warn_key)
-                        symbols = symbols - set(skipped)
+                            symbol_list = ", ".join(sorted(skipped))
+                            warned = getattr(self, "_unsupported_coin_warnings", None)
+                            if warned is None:
+                                warned = set()
+                                setattr(self, "_unsupported_coin_warnings", warned)
+                            warn_key = (self.exchange, coin_list, symbol_list, k_coins)
+                            if warn_key not in warned:
+                                logging.info(
+                                    "[config] skipping unsupported markets for %s: coins=%s symbols=%s exchange=%s",
+                                    k_coins,
+                                    coin_list,
+                                    symbol_list,
+                                    getattr(self, "exchange", "?"),
+                                )
+                                warned.add(warn_key)
+                            symbols = symbols - set(skipped)
             symbols_already = getattr(self, k_coins)[pside]
             if symbols_already != symbols:
                 added = symbols - symbols_already
@@ -8000,8 +8093,11 @@ class Passivbot:
                 if not hasattr(self, k):
                     setattr(self, k, {"long": set(), "short": set()})
                 config_sources = self.config.get("_coins_sources", {})
-                raw_source = config_sources.get(k, self.live_value(k))
-                parsed = normalize_coins_source(raw_source)
+                if k in config_sources:
+                    raw_source = config_sources[k]
+                else:
+                    raw_source = self.live_value(k)
+                parsed = normalize_coins_source(raw_source, allow_all=(k == "approved_coins"))
                 if k == "approved_coins":
                     log_psides = {ps for ps in parsed if self.is_pside_enabled(ps)}
                 else:
@@ -8030,9 +8126,6 @@ class Passivbot:
                     if pside in self._disabled_psides_logged:
                         logging.info(f"{pside} side re-enabled; restoring approved coin handling.")
                         self._disabled_psides_logged.discard(pside)
-                if self.live_value("empty_means_all_approved") and not self.approved_coins[pside]:
-                    # if approved_coins is empty, all coins are approved
-                    self.approved_coins[pside] = self.eligible_symbols
                 self.approved_coins_minus_ignored_coins[pside] = self._filter_approved_symbols(
                     pside, self.approved_coins[pside] - self.ignored_coins[pside]
                 )
@@ -8313,7 +8406,7 @@ async def main():
     del template_config["backtest"]
     if "logging" in template_config and isinstance(template_config["logging"], dict):
         template_config["logging"].pop("level", None)
-    add_config_arguments(
+    allowed_config_keys = add_config_arguments(
         parser,
         template_config,
         command="live",
@@ -8327,7 +8420,7 @@ async def main():
     initial_log_level = resolve_log_level(cli_log_level, None, fallback=1)
     configure_logging(debug=initial_log_level)
     source_config, base_config_path, raw_snapshot = load_input_config(args.config_path)
-    update_config_with_args(source_config, args, verbose=True)
+    update_config_with_args(source_config, args, verbose=True, allowed_keys=allowed_config_keys)
     config = prepare_config(
         source_config,
         base_config_path=base_config_path,
@@ -8339,13 +8432,19 @@ async def main():
     )
     config_logging_value = get_optional_config_value(config, "logging.level", None)
     effective_log_level = resolve_log_level(cli_log_level, config_logging_value, fallback=1)
-    if effective_log_level != initial_log_level:
-        configure_logging(debug=effective_log_level)
     logging_section = config.get("logging")
     if not isinstance(logging_section, dict):
         logging_section = {}
     config["logging"] = logging_section
     logging_section["level"] = effective_log_level
+    live_user = require_live_value(config, "user")
+    log_file_settings = resolve_live_log_file_settings(
+        config,
+        user=live_user,
+        command_args=[sys.argv[0], *raw_argv],
+    )
+    if effective_log_level != initial_log_level or log_file_settings["log_file"]:
+        configure_logging(debug=effective_log_level, **log_file_settings)
 
     custom_endpoints_cli = args.custom_endpoints
     live_section = config.get("live") if isinstance(config.get("live"), dict) else {}
@@ -8399,10 +8498,10 @@ async def main():
         preloaded=preloaded_override,
     )
 
-    user_info = load_user_info(require_live_value(config, "user"))
+    user_info = load_user_info(live_user)
     # Reconfigure logging with exchange prefix now that we know the exchange
     exchange_prefix = user_info["exchange"]
-    configure_logging(debug=effective_log_level, prefix=exchange_prefix)
+    configure_logging(debug=effective_log_level, prefix=exchange_prefix, **log_file_settings)
     await load_markets(user_info["exchange"], verbose=True)
 
     config = parse_overrides(config, verbose=True)
