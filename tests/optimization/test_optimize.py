@@ -34,7 +34,9 @@ from optimize import (
     apply_fine_tune_bounds,
     extract_configs,
     get_starting_configs,
+    iter_starting_configs,
     configs_to_individuals,
+    configs_to_individuals_streaming,
     ConstraintAwareFitness,
     ResultRecorder,
 )
@@ -1049,6 +1051,20 @@ class TestGetStartingConfigs:
             result = get_starting_configs(tmpdir)
             assert len(result) == 2
 
+    def test_iter_directory(self):
+        from config_utils import get_template_config
+        import json
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            template = get_template_config()
+            with open(os.path.join(tmpdir, "config1.json"), "w") as f:
+                f.write(json.dumps(template))
+            with open(os.path.join(tmpdir, "config2.json"), "w") as f:
+                f.write(json.dumps(template))
+
+            result = list(iter_starting_configs(tmpdir))
+            assert len(result) == 2
+
 
 class TestConfigsToIndividuals:
     """Test configs_to_individuals function."""
@@ -1071,6 +1087,18 @@ class TestConfigsToIndividuals:
         # Should return 2 individuals: original + one with lowered TWE
         assert len(result) >= 1
         assert len(result[0]) == len(bounds)
+
+    def test_streaming_matches_eager(self):
+        from config_utils import get_template_config
+
+        config = get_template_config()
+        bounds = extract_bounds_tuple_list_from_config(config)
+
+        eager = configs_to_individuals([config, config], bounds, 6)
+        streamed, raw_count = configs_to_individuals_streaming(iter([config, config]), bounds, 6)
+
+        assert raw_count == 2
+        assert sorted(map(tuple, streamed)) == sorted(map(tuple, eager))
 
     def test_bot_only_config(self):
         from config_utils import get_template_config
@@ -1402,7 +1430,7 @@ class TestEvaluator:
             config_to_individual(mock_config, evaluator.bounds, evaluator.sig_digits)
         )
 
-        with patch("optimize.build_backtest_payload", return_value=object()), patch(
+        with patch("optimize.build_backtest_payload", return_value=object()) as build_payload, patch(
             "optimize.execute_backtest",
             side_effect=PanicException(
                 "hard-stop evaluation failed at k 1 ts 2 equity -1 peak_strategy_equity 10: equity must be finite and > 0"
@@ -1415,6 +1443,7 @@ class TestEvaluator:
         assert metrics["constraint_violation"] == INVALID_BACKTEST_CANDIDATE_PENALTY
         assert "PanicException" in metrics["error"]
         assert metrics["stats"] == {}
+        assert build_payload.call_args.kwargs["metrics_only"] is True
 
     def test_suite_evaluate_converts_recoverable_backtest_panic_to_penalty(self):
         from optimize import Evaluator, SuiteEvaluator, INVALID_BACKTEST_CANDIDATE_PENALTY
@@ -1454,7 +1483,7 @@ class TestEvaluator:
         evaluator = SuiteEvaluator(base, [ctx], {})
         individual = DummyIndividual(config_to_individual(mock_config, base.bounds, base.sig_digits))
 
-        with patch("optimize.build_backtest_payload", return_value=object()), patch(
+        with patch("optimize.build_backtest_payload", return_value=object()) as build_payload, patch(
             "optimize.execute_backtest",
             side_effect=PanicException(
                 "hard-stop evaluation failed at k 1 ts 2 equity -1 peak_strategy_equity 10: equity must be finite and > 0"
@@ -1467,6 +1496,7 @@ class TestEvaluator:
         assert metrics["constraint_violation"] == INVALID_BACKTEST_CANDIDATE_PENALTY
         assert "PanicException" in metrics["error"]
         assert metrics["suite_metrics"] == {}
+        assert build_payload.call_args.kwargs["metrics_only"] is True
 
 
 def _remove_nested_path(mapping, path):
