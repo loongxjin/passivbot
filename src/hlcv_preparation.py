@@ -2007,6 +2007,16 @@ async def _prepare_hlcvs_combined_impl(
     global_start_time = min(df.timestamp.iloc[0] for df in chosen_data_per_coin.values())
     global_end_time = max(df.timestamp.iloc[-1] for df in chosen_data_per_coin.values())
 
+    # Clamp end time to now to avoid issues when cached data or config extends into the future
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if global_end_time > now_ms:
+        logging.warning(
+            "global_end_time %s is in the future; clamping to current time %s",
+            ts_to_date(global_end_time),
+            ts_to_date(now_ms),
+        )
+        global_end_time = now_ms
+
     timestamps = np.arange(global_start_time, global_end_time + interval_ms, interval_ms)
     n_timesteps = len(timestamps)
     valid_coins = sorted(chosen_data_per_coin.keys())
@@ -2051,6 +2061,16 @@ async def _prepare_hlcvs_combined_impl(
             exchange_volume_ratios_mapped[ex1][ex0] = exchange_volume_ratios[(ex0, ex1)]
             exchange_volume_ratios_mapped[ex1][ex1] = 1.0
             exchange_volume_ratios_mapped[ex0][ex0] = 1.0
+        if not exchange_volume_ratios:
+            logging.warning(
+                "Could not compute volume ratios between exchanges %s; using 1.0 as fallback",
+                ", ".join(sorted(exchanges_with_data)),
+            )
+            for ex in exchanges_with_data:
+                exchange_volume_ratios_mapped[ex][ex] = 1.0
+                for other_ex in exchanges_with_data:
+                    if ex != other_ex:
+                        exchange_volume_ratios_mapped[ex][other_ex] = 1.0
 
     # Log volume normalization ratios (used to scale volumes when combining multi-exchange data)
     if len(exchanges_counts) > 1:
