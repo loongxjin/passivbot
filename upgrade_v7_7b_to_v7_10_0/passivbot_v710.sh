@@ -1,6 +1,6 @@
 #!/bin/bash
 # Passivbot v7.10.0 多机器人管理脚本
-# 适配新版统一 CLI: passivbot live -u <user> -c <config>
+# 适配新版统一 CLI: passivbot live <config> -u <user>
 #
 # 用法:
 #   ./passivbot_v710.sh create <服务名> <配置> <api-key>   # 创建新机器人实例
@@ -325,8 +325,8 @@ Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
 WorkingDirectory=$PASSIVBOT_DIR
-Environment="PATH=$PASSIVBOT_DIR/venv/bin"
-ExecStart=$PASSIVBOT_DIR/venv/bin/passivbot live -u $api_key -c $config_rel --log-level info
+Environment="PATH=$PASSIVBOT_DIR/venv/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=$PASSIVBOT_DIR/venv/bin/passivbot live $config_rel -u $api_key --log-level info
 Restart=always
 RestartSec=10
 StandardOutput=append:$log_dir/${service_name}.systemd.log
@@ -418,8 +418,8 @@ Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
 WorkingDirectory=$PASSIVBOT_DIR
-Environment="PATH=$PASSIVBOT_DIR/venv/bin"
-ExecStart=$PASSIVBOT_DIR/venv/bin/passivbot live -u $api_key -c $config_rel --log-level info
+Environment="PATH=$PASSIVBOT_DIR/venv/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=$PASSIVBOT_DIR/venv/bin/passivbot live $config_rel -u $api_key --log-level info
 Restart=always
 RestartSec=10
 StandardOutput=append:$log_dir/${service_name}.systemd.log
@@ -698,8 +698,8 @@ Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
 WorkingDirectory=$PASSIVBOT_DIR
-Environment="PATH=$PASSIVBOT_DIR/venv/bin"
-ExecStart=$PASSIVBOT_DIR/venv/bin/passivbot live -u $api_key -c $config --log-level info
+Environment="PATH=$PASSIVBOT_DIR/venv/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=$PASSIVBOT_DIR/venv/bin/passivbot live $config -u $api_key --log-level info
 Restart=always
 RestartSec=10
 StandardOutput=append:$log_dir/${service_name}.systemd.log

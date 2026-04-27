@@ -80,6 +80,7 @@ scan_instances() {
 find_matching_config() {
     local old_config="$1"
     local new_dir="$2"
+    new_dir="${new_dir%/}"  # 移除尾部斜杠，避免双斜杠
     local basename=$(basename "$old_config" .json)
     # 尝试同名匹配
     if [ -f "$new_dir/${basename}.json" ]; then
@@ -299,8 +300,8 @@ Type=simple
 User=$RUN_USER
 Group=$RUN_GROUP
 WorkingDirectory=$PASSIVBOT_DIR
-Environment="PATH=$PASSIVBOT_DIR/venv/bin"
-ExecStart=$PASSIVBOT_DIR/venv/bin/passivbot live -u $user -c $new_rel --log-level info
+Environment="PATH=$PASSIVBOT_DIR/venv/bin:/home/ubuntu/.cargo/bin:/usr/local/bin:/usr/bin:/bin"
+ExecStart=$PASSIVBOT_DIR/venv/bin/passivbot live $new_rel -u $user --log-level info
 Restart=always
 RestartSec=10
 StandardOutput=append:$log_dir/${svc}.systemd.log
@@ -322,8 +323,10 @@ EOF
         SUCCESS=$((SUCCESS + 1))
     else
         echo -e "${RED}✗ 失败${NC}"
-        echo "  日志: tail -n 50 $PASSIVBOT_DIR/logs/$user.log"
-        echo "  systemd日志: tail -n 50 $log_dir/${svc}.systemd.log"
+        echo "  排查命令:"
+        echo "    sudo journalctl -u $svc -n 50 --no-pager"
+        echo "    tail -n 50 $log_dir/${svc}.systemd.log"
+        echo "  手动测试: cd $PASSIVBOT_DIR && venv/bin/passivbot live $new_rel -u $user --log-level info"
         FAILED=$((FAILED + 1))
     fi
 done
