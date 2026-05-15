@@ -35,6 +35,21 @@ def _write_day(root, exchange, symbol, day, rows):
     np.save(symbol_dir / f"{day}.npy", np.array(rows, dtype=LEGACY_DTYPE))
 
 
+def _minimal_bot_config():
+    return {
+        "long": {
+            "n_positions": 1,
+            "total_wallet_exposure_limit": 1.0,
+            "wallet_exposure_limit": 1.0,
+        },
+        "short": {
+            "n_positions": 0,
+            "total_wallet_exposure_limit": 0.0,
+            "wallet_exposure_limit": 0.0,
+        },
+    }
+
+
 @pytest.mark.asyncio
 async def test_fetch_coin_range_into_v2_store_preserves_intraday_end(tmp_path):
     catalog = OhlcvCatalog(tmp_path / "caches" / "ohlcvs" / "catalog.sqlite")
@@ -82,6 +97,53 @@ async def test_fetch_coin_range_into_v2_store_preserves_intraday_end(tmp_path):
     rng = store.read_range("binance", "1m", "ETH/USDT:USDT", start_ts, end_ts)
     assert rng.valid.all()
     np.testing.assert_array_equal(rng.timestamps, np.array([start_ts, start_ts + 60_000, end_ts]))
+
+
+@pytest.mark.asyncio
+async def test_fetch_coin_range_into_v2_store_prefers_v2_fetcher(tmp_path):
+    catalog = OhlcvCatalog(tmp_path / "caches" / "ohlcvs" / "catalog.sqlite")
+    store = OhlcvStore(tmp_path / "caches" / "ohlcvs", catalog)
+    start_ts = month_start_ts(2026, 4)
+    end_ts = start_ts + 60_000
+    calls = []
+
+    class FakeOhlcvManager:
+        cm = None
+
+        def update_timestamp_range(self, new_start_ts, new_end_ts):
+            self.start_ts = int(new_start_ts)
+            self.end_ts = int(new_end_ts)
+
+        async def fetch_ohlcvs_for_v2_store(self, coin, *, start_ts, end_ts):
+            calls.append((coin, int(start_ts), int(end_ts)))
+            return pd.DataFrame(
+                {
+                    "timestamp": np.array([start_ts, end_ts], dtype=np.int64),
+                    "high": np.array([101.0, 102.0], dtype=np.float32),
+                    "low": np.array([99.0, 100.0], dtype=np.float32),
+                    "close": np.array([100.0, 101.0], dtype=np.float32),
+                    "volume": np.array([10.0, 11.0], dtype=np.float32),
+                }
+            )
+
+        async def get_ohlcvs(self, coin):
+            raise AssertionError("v2 fetch must not use legacy-persisting get_ohlcvs")
+
+    ok = await _fetch_coin_range_into_v2_store(
+        om=FakeOhlcvManager(),
+        catalog=catalog,
+        store=store,
+        exchange="binance",
+        coin="ETH",
+        symbol="ETH/USDT:USDT",
+        start_ts=start_ts,
+        end_ts=end_ts,
+    )
+
+    assert ok
+    assert calls == [("ETH", start_ts, end_ts)]
+    rng = store.read_range("binance", "1m", "ETH/USDT:USDT", start_ts, end_ts)
+    assert rng.valid.all()
 
 
 @pytest.mark.asyncio
@@ -387,7 +449,7 @@ async def test_try_prepare_hlcvs_v2_local_uses_local_cache(monkeypatch, tmp_path
             "warmup_ratio": 0.0,
             "max_warmup_minutes": 0.0,
         },
-        "bot": {"long": {}, "short": {}},
+        "bot": _minimal_bot_config(),
     }
 
     prepared = await try_prepare_hlcvs_v2_local(config, "binance")
@@ -428,7 +490,7 @@ async def test_prepare_hlcvs_mss_prefers_local_v2_before_full_prepare(monkeypatc
             "warmup_ratio": 0.0,
             "max_warmup_minutes": 0.0,
         },
-        "bot": {"long": {}, "short": {}},
+        "bot": _minimal_bot_config(),
     }
 
     monkeypatch.setattr(rust_utils, "check_and_maybe_compile", lambda *args, **kwargs: None)
@@ -492,7 +554,7 @@ async def test_prepare_hlcvs_mss_skips_inner_v2_after_outer_v2_miss(monkeypatch,
             "warmup_ratio": 0.0,
             "max_warmup_minutes": 0.0,
         },
-        "bot": {"long": {}, "short": {}},
+        "bot": _minimal_bot_config(),
     }
 
     monkeypatch.setattr(rust_utils, "check_and_maybe_compile", lambda *args, **kwargs: None)
@@ -558,7 +620,7 @@ async def test_prepare_hlcvs_prefers_local_v2_before_legacy_prepare(monkeypatch)
             "warmup_ratio": 0.0,
             "max_warmup_minutes": 0.0,
         },
-        "bot": {"long": {}, "short": {}},
+        "bot": _minimal_bot_config(),
     }
 
     async def fake_try_prepare(*args, **kwargs):
@@ -610,7 +672,7 @@ async def test_try_prepare_hlcvs_v2_local_fetches_missing_remote_range_into_stor
     async def fake_first_timestamps_unified(coins, exchange=None):
         return {coin: int(ts[0]) for coin in coins}
 
-    async def fake_get_ohlcvs(self, coin, start_date=None, end_date=None):
+    async def fake_fetch_ohlcvs_for_v2_store(self, coin, *, start_ts, end_ts):
         if coin == "ETH":
             closes = np.array([100.0], dtype=np.float64)
         elif coin == "BTC":
@@ -632,7 +694,10 @@ async def test_try_prepare_hlcvs_v2_local_fetches_missing_remote_range_into_stor
 
     monkeypatch.setattr("hlcv_preparation.load_markets", fake_load_markets)
     monkeypatch.setattr("hlcv_preparation.get_first_timestamps_unified", fake_first_timestamps_unified)
-    monkeypatch.setattr("hlcv_preparation.HLCVManager.get_ohlcvs", fake_get_ohlcvs)
+    monkeypatch.setattr(
+        "hlcv_preparation.HLCVManager.fetch_ohlcvs_for_v2_store",
+        fake_fetch_ohlcvs_for_v2_store,
+    )
 
     config = {
         "backtest": {
@@ -648,7 +713,7 @@ async def test_try_prepare_hlcvs_v2_local_fetches_missing_remote_range_into_stor
             "warmup_ratio": 0.0,
             "max_warmup_minutes": 0.0,
         },
-        "bot": {"long": {}, "short": {}},
+        "bot": _minimal_bot_config(),
     }
 
     prepared = await try_prepare_hlcvs_v2_local(config, "binance")
@@ -707,13 +772,16 @@ async def test_try_prepare_hlcvs_v2_local_persists_persistent_cm_gap_after_empty
                 ]
             }
 
-    async def fake_get_ohlcvs(self, coin, start_date=None, end_date=None):
+    async def fake_fetch_ohlcvs_for_v2_store(self, coin, *, start_ts, end_ts):
         self.cm = FakeCM()
         return pd.DataFrame(columns=["timestamp", "open", "high", "low", "close", "volume"])
 
     monkeypatch.setattr("hlcv_preparation.load_markets", fake_load_markets)
     monkeypatch.setattr("hlcv_preparation.get_first_timestamps_unified", fake_first_timestamps_unified)
-    monkeypatch.setattr("hlcv_preparation.HLCVManager.get_ohlcvs", fake_get_ohlcvs)
+    monkeypatch.setattr(
+        "hlcv_preparation.HLCVManager.fetch_ohlcvs_for_v2_store",
+        fake_fetch_ohlcvs_for_v2_store,
+    )
 
     config = {
         "backtest": {
@@ -729,7 +797,7 @@ async def test_try_prepare_hlcvs_v2_local_persists_persistent_cm_gap_after_empty
             "warmup_ratio": 0.0,
             "max_warmup_minutes": 0.0,
         },
-        "bot": {"long": {}, "short": {}},
+        "bot": _minimal_bot_config(),
     }
 
     prepared = await try_prepare_hlcvs_v2_local(config, "binance")
@@ -745,9 +813,12 @@ async def test_try_prepare_hlcvs_v2_local_persists_persistent_cm_gap_after_empty
     assert len(attempts) == 1
     assert attempts[0].outcome == "empty"
 
-    async def fail_get_ohlcvs(self, coin, start_date=None, end_date=None):
+    async def fail_fetch_ohlcvs_for_v2_store(self, coin, *, start_ts, end_ts):
         raise AssertionError("persistent v2 gap should block a second remote fetch attempt")
 
-    monkeypatch.setattr("hlcv_preparation.HLCVManager.get_ohlcvs", fail_get_ohlcvs)
+    monkeypatch.setattr(
+        "hlcv_preparation.HLCVManager.fetch_ohlcvs_for_v2_store",
+        fail_fetch_ohlcvs_for_v2_store,
+    )
     second = await try_prepare_hlcvs_v2_local(config, "binance")
     assert second is None
