@@ -87,9 +87,25 @@ show_help() {
     echo -e "  ${GREEN}migrate${NC} <服务名>"
     echo "      将旧格式 systemd 服务迁移到 v7.10.0 CLI 格式"
     echo ""
-    echo -e "  ${GREEN}help${NC}"
-    echo "      显示此帮助"
-    echo ""
+  echo -e "  ${RED}panic${NC} <服务名> [--market]"
+  echo "      一键 panic 指定机器人（设为 panic 模式并重启）"
+  echo "      --market  使用市价单清仓（默认 limit 单）"
+  echo "      例: $0 panic okx_btc"
+  echo "      例: $0 panic okx_btc --market"
+  echo ""
+  echo -e "  ${RED}panic-all${NC} [--market]"
+  echo "      一键 panic 所有机器人"
+  echo "      --market  使用市价单清仓（默认 limit 单）"
+  echo ""
+  echo -e "  ${GREEN}unpanic${NC} <服务名>"
+  echo "      恢复指定机器人到 panic 前的配置"
+  echo ""
+  echo -e "  ${GREEN}unpanic-all${NC}"
+  echo "      恢复所有机器人到 panic 前的配置"
+  echo ""
+  echo -e "  ${GREEN}help${NC}"
+  echo "      显示此帮助"
+  echo ""
 }
 
 validate_service_name() {
@@ -729,6 +745,341 @@ EOF
     echo "原服务文件备份: $SYSTEMD_DIR/$service_name.service.pre_v710.*"
 }
 
+panic_single() {
+    local input_name="$1"
+    local market_flag="${2:-}"
+    local service_name=$(get_service_name "$input_name")
+
+    echo "========================================"
+    echo -e "${RED}⚡ PANIC 模式${NC} - 紧急清仓"
+    echo "========================================"
+    echo ""
+
+    if [ -z "$service_name" ]; then
+        echo -e "${RED}错误: 请指定服务名${NC}"
+        echo "用法: $0 panic <服务名> [--market]"
+        return 1
+    fi
+
+    if [ ! -f "$SYSTEMD_DIR/$service_name.service" ]; then
+        echo -e "${RED}错误: 服务 '$service_name' 不存在${NC}"
+        return 1
+    fi
+
+    # 提取配置文件路径
+    local config_rel=$(grep "ExecStart=" "$SYSTEMD_DIR/$service_name" 2>/dev/null | grep -oP 'configs/[^[:space:]]+\.json' || echo "")
+    if [ -z "$config_rel" ]; then
+        echo -e "${RED}错误: 无法从服务文件提取配置路径${NC}"
+        return 1
+    fi
+    local config_file="$PASSIVBOT_DIR/$config_rel"
+
+    if [ ! -f "$config_file" ]; then
+        echo -e "${RED}错误: 配置文件不存在: $config_file${NC}"
+        return 1
+    fi
+
+    local use_market=false
+    if [ "$market_flag" = "--market" ] || [ "$market_flag" = "-m" ]; then
+        use_market=true
+    fi
+
+    echo -e "服务: ${CYAN}$service_name${NC}"
+    echo -e "配置: $config_rel"
+    if [ "$use_market" = true ]; then
+        echo -e "清仓方式: ${RED}市价单 (market)${NC}"
+    else
+        echo -e "清仓方式: ${YELLOW}限价单 (limit)${NC}"
+    fi
+    echo ""
+    echo -e "${YELLOW}警告: 这将把所有仓位设为 panic 模式，bot 会立即尝试平掉全部仓位！${NC}"
+    echo ""
+
+    read -p "确认执行 panic? (yes/no): " confirm
+    if [ "$confirm" != "yes" ]; then
+        echo "已取消"
+        return 0
+    fi
+
+    # 备份原配置
+    local backup_file="${config_file}.pre_panic.$(date +%Y%m%d_%H%M%S)"
+    cp "$config_file" "$backup_file"
+    echo ""
+    echo "原配置已备份: $backup_file"
+
+    # 用 Python 修改配置
+    local market_val="limit"
+    if [ "$use_market" = true ]; then
+        market_val="market"
+    fi
+
+    python3 -c "
+import json, sys
+
+config_path = '$config_file'
+try:
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
+except Exception as e:
+    print(f'错误: 无法读取配置文件: {e}', file=sys.stderr)
+    sys.exit(1)
+
+# 设置 forced_mode 为 panic
+cfg.setdefault('live', {})
+cfg['live']['forced_mode_long'] = 'panic'
+cfg['live']['forced_mode_short'] = 'panic'
+
+# 设置 panic close 订单类型（需要同时开启 hsl_enabled 才能生效）
+cfg.setdefault('bot', {})
+for pside in ('long', 'short'):
+    cfg['bot'].setdefault(pside, {})
+    cfg['bot'][pside]['hsl_panic_close_order_type'] = '$market_val'
+    if '$market_val' == 'market':
+        # 市价清仓需要 hsl_enabled=true 才会走 market 路径
+        # 但要设置极高的 red_threshold 防止 HSL 自行干预覆盖 panic
+        cfg['bot'][pside]['hsl_enabled'] = True
+        cfg['bot'][pside]['hsl_red_threshold'] = 0.99
+        cfg['bot'][pside]['hsl_no_restart_drawdown_threshold'] = 1.0
+
+try:
+    with open(config_path, 'w') as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+except Exception as e:
+    print(f'错误: 无法写入配置文件: {e}', file=sys.stderr)
+    sys.exit(1)
+
+print('配置修改成功')
+"
+
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}配置修改失败，正在恢复备份...${NC}"
+        cp "$backup_file" "$config_file"
+        return 1
+    fi
+
+    echo -e "${GREEN}配置已修改${NC}"
+    echo ""
+
+    # 重启服务
+    echo "重启服务..."
+    sudo systemctl restart "$service_name"
+    sleep 3
+
+    if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+        echo -e "${GREEN}服务已重启，panic 模式已生效！${NC}"
+    else
+        echo -e "${RED}服务启动失败，请检查日志${NC}"
+        echo "查看日志: $0 logs $input_name"
+    fi
+    echo ""
+    echo "恢复原配置: $0 unpanic $input_name"
+}
+
+panic_all() {
+    local market_flag="${1:-}"
+    local use_market=false
+    if [ "$market_flag" = "--market" ] || [ "$market_flag" = "-m" ]; then
+        use_market=true
+    fi
+
+    echo "========================================"
+    echo -e "${RED}⚡⚡⚡ PANIC ALL ⚡⚡⚡${NC}"
+    echo -e "${RED}所有机器人紧急清仓${NC}"
+    echo "========================================"
+    echo ""
+
+    if [ "$use_market" = true ]; then
+        echo -e "清仓方式: ${RED}市价单 (market)${NC}"
+    else
+        echo -e "清仓方式: ${YELLOW}限价单 (limit)${NC}"
+    fi
+    echo ""
+    echo -e "${RED}警告: 这将把所有运行中的机器人设为 panic 模式！${NC}"
+    echo -e "${RED}每个机器人会立即尝试平掉全部仓位！${NC}"
+    echo ""
+
+    read -p "确认对所有机器人执行 panic? 输入 YES 确认: " confirm
+    if [ "$confirm" != "YES" ]; then
+        echo "已取消"
+        return 0
+    fi
+
+    local count=0
+    local failed=0
+    for service_file in "$SYSTEMD_DIR"/passivbot*.service; do
+        if [ ! -f "$service_file" ]; then
+            continue
+        fi
+        local svc_name=$(basename "$service_file" .service)
+        local config_rel=$(grep "ExecStart=" "$service_file" 2>/dev/null | grep -oP 'configs/[^[:space:]]+\\.json' || echo "")
+        if [ -z "$config_rel" ]; then
+            echo -e "${RED}跳过 $svc_name: 无法提取配置路径${NC}"
+            failed=$((failed + 1))
+            continue
+        fi
+        local config_file="$PASSIVBOT_DIR/$config_rel"
+        if [ ! -f "$config_file" ]; then
+            echo -e "${RED}跳过 $svc_name: 配置文件不存在${NC}"
+            failed=$((failed + 1))
+            continue
+        fi
+
+        echo ""
+        echo -e "处理: ${CYAN}$svc_name${NC} ($config_rel)"
+
+        # 备份
+        local backup_file="${config_file}.pre_panic.$(date +%Y%m%d_%H%M%S)"
+        cp "$config_file" "$backup_file"
+
+        # 修改配置
+        local market_val="limit"
+        if [ "$use_market" = true ]; then
+            market_val="market"
+        fi
+
+        python3 -c "
+import json, sys
+cfg_path = '$config_file'
+try:
+    with open(cfg_path, 'r') as f:
+        cfg = json.load(f)
+except Exception as e:
+    print(f'错误: 无法读取 {cfg_path}: {e}', file=sys.stderr)
+    sys.exit(1)
+cfg.setdefault('live', {})
+cfg['live']['forced_mode_long'] = 'panic'
+cfg['live']['forced_mode_short'] = 'panic'
+cfg.setdefault('bot', {})
+for pside in ('long', 'short'):
+    cfg['bot'].setdefault(pside, {})
+    cfg['bot'][pside]['hsl_panic_close_order_type'] = '$market_val'
+    if '$market_val' == 'market':
+        cfg['bot'][pside]['hsl_enabled'] = True
+        cfg['bot'][pside]['hsl_red_threshold'] = 0.99
+        cfg['bot'][pside]['hsl_no_restart_drawdown_threshold'] = 1.0
+try:
+    with open(cfg_path, 'w') as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+except Exception as e:
+    print(f'错误: 无法写入 {cfg_path}: {e}', file=sys.stderr)
+    sys.exit(1)
+"
+
+        if [ $? -ne 0 ]; then
+            echo -e "${RED}配置修改失败，恢复备份${NC}"
+            cp "$backup_file" "$config_file"
+            failed=$((failed + 1))
+            continue
+        fi
+
+        # 重启
+        sudo systemctl restart "$svc_name" 2>/dev/null
+        count=$((count + 1))
+        echo -e "  ${GREEN}已重启${NC}"
+    done
+
+    echo ""
+    echo "========================================"
+    echo -e "${GREEN}已完成: $count 个机器人已进入 panic 模式${NC}"
+    if [ $failed -gt 0 ]; then
+        echo -e "${RED}失败: $failed 个${NC}"
+    fi
+    echo ""
+    echo "恢复所有: $0 unpanic-all"
+    echo "========================================"
+}
+
+unpanic_single() {
+    local input_name="$1"
+    local service_name=$(get_service_name "$input_name")
+
+    echo "========================================"
+    echo "恢复 panic 前配置"
+    echo "========================================"
+    echo ""
+
+    if [ -z "$service_name" ]; then
+        echo -e "${RED}错误: 请指定服务名${NC}"
+        return 1
+    fi
+
+    if [ ! -f "$SYSTEMD_DIR/$service_name.service" ]; then
+        echo -e "${RED}错误: 服务 '$service_name' 不存在${NC}"
+        return 1
+    fi
+
+    local config_rel=$(grep "ExecStart=" "$SYSTEMD_DIR/$service_name" 2>/dev/null | grep -oP 'configs/[^[:space:]]+\\.json' || echo "")
+    if [ -z "$config_rel" ]; then
+        echo -e "${RED}错误: 无法提取配置路径${NC}"
+        return 1
+    fi
+    local config_file="$PASSIVBOT_DIR/$config_rel"
+
+    # 找到最新的 pre_panic 备份
+    local backup_file=$(ls -t "${config_file}".pre_panic.* 2>/dev/null | head -1)
+    if [ -z "$backup_file" ]; then
+        echo -e "${RED}错误: 未找到 panic 备份文件${NC}"
+        return 1
+    fi
+
+    echo -e "服务: ${CYAN}$service_name${NC}"
+    echo -e "恢复配置: $config_rel"
+    echo -e "从备份: $backup_file"
+    echo ""
+
+    cp "$backup_file" "$config_file"
+    echo -e "${GREEN}配置已恢复${NC}"
+
+    # 重启服务
+    echo "重启服务..."
+    sudo systemctl restart "$service_name"
+    sleep 3
+
+    if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+        echo -e "${GREEN}服务已重启，恢复正常模式${NC}"
+    else
+        echo -e "${RED}服务启动失败，请检查日志${NC}"
+    fi
+}
+
+unpanic_all() {
+    echo "========================================"
+    echo "恢复所有机器人 panic 前配置"
+    echo "========================================"
+    echo ""
+
+    local count=0
+    local failed=0
+    for service_file in "$SYSTEMD_DIR"/passivbot*.service; do
+        if [ ! -f "$service_file" ]; then
+            continue
+        fi
+        local svc_name=$(basename "$service_file" .service)
+        local config_rel=$(grep "ExecStart=" "$service_file" 2>/dev/null | grep -oP 'configs/[^[:space:]]+\\.json' || echo "")
+        if [ -z "$config_rel" ]; then
+            continue
+        fi
+        local config_file="$PASSIVBOT_DIR/$config_rel"
+
+        local backup_file=$(ls -t "${config_file}".pre_panic.* 2>/dev/null | head -1)
+        if [ -z "$backup_file" ]; then
+            continue
+        fi
+
+        echo -e "恢复 ${CYAN}$svc_name${NC} <- $backup_file"
+        cp "$backup_file" "$config_file"
+        sudo systemctl restart "$svc_name" 2>/dev/null
+        count=$((count + 1))
+    done
+
+    echo ""
+    if [ $count -gt 0 ]; then
+        echo -e "${GREEN}已恢复 $count 个机器人${NC}"
+    else
+        echo -e "${YELLOW}未找到需要恢复的机器人${NC}"
+    fi
+}
+
 main() {
     local cmd="${1:-help}"
 
@@ -773,6 +1124,21 @@ main() {
             ;;
         check)
             run_config_check
+            ;;
+        panic|p)
+            shift
+            panic_single "$1" "$2"
+            ;;
+        panic-all|pa)
+            shift
+            panic_all "$1"
+            ;;
+        unpanic|up)
+            shift
+            unpanic_single "$1"
+            ;;
+        unpanic-all|upa)
+            unpanic_all
             ;;
         migrate|m)
             shift
