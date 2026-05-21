@@ -1225,6 +1225,38 @@ def _get_hlcvs_cache_dir_for_save(config, exchange, coins, cache_hash, timestamp
     return HLCVS_CACHE_ROOT / dir_name
 
 
+def _is_cache_data_stale(timestamps, config):
+    """Check if cached data is stale relative to the effective end date.
+
+    When end_date is in the future, hlcv_preparation clamps the actual data
+    range to now.  A cache built when "now" was earlier therefore contains
+    stale data.  We replicate that clamping logic here and reject the cache
+    if the gap between the cached last timestamp and the effective end exceeds
+    a one-day tolerance.
+    """
+    if timestamps is None or len(timestamps) == 0:
+        return True
+    requested_end_ts = int(
+        date_to_ts(format_end_date(require_config_value(config, "backtest.end_date")))
+    )
+    now_ts = int(utc_ms())
+    # Mirror the clamping done in hlcv_preparation
+    effective_end_ts = min(requested_end_ts, now_ts)
+    cached_end_ts = int(timestamps[-1])
+    one_day_ms = 86_400_000
+    gap_ms = effective_end_ts - cached_end_ts
+    if gap_ms > one_day_ms:
+        logging.info(
+            "[cache] data is stale: cached_end=%s effective_end=%s gap=%.1f days. "
+            "Will re-fetch.",
+            ts_to_date(cached_end_ts),
+            ts_to_date(effective_end_ts),
+            gap_ms / one_day_ms,
+        )
+        return True
+    return False
+
+
 def load_coins_hlcvs_from_cache(config, exchange, warmup_minutes=0):
     cache_hash = get_cache_hash(config, exchange)
     cache_dir = _resolve_hlcvs_cache_dir(cache_hash)
@@ -1300,6 +1332,9 @@ def load_coins_hlcvs_from_cache(config, exchange, warmup_minutes=0):
                     f"{exchange} No BTC/USD prices in cache; cache invalid for fractional collateral"
                 )
                 return None
+        # Check if cached data is stale (actual end too far from effective end)
+        if _is_cache_data_stale(timestamps, config):
+            return None
         results_path = oj(
             require_config_value(config, "backtest.base_dir"), exchange, ""
         )
