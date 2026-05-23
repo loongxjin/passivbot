@@ -1431,11 +1431,19 @@ def ensure_valid_index_metadata(mss, hlcvs, coins, warmup_map=None):
             last_idx = int(meta["last_valid_index"])
         else:
             close_series = hlcvs[:, idx, 2]
+            vol_series = hlcvs[:, idx, 3]
             finite = np.isfinite(close_series)
             if finite.any():
                 valid_indices = np.where(finite)[0]
                 first_idx = int(valid_indices[0])
                 last_idx = int(valid_indices[-1])
+                # Exclude stale tail: significant zero-volume run at the end
+                # indicates OhlcvStore placeholder data, not real candles.
+                vol_gt_zero = vol_series > 0.0
+                if vol_gt_zero.any():
+                    last_real = int(np.where(vol_gt_zero)[0][-1])
+                    if last_real < last_idx:
+                        last_idx = last_real
             else:
                 first_idx = int(total_steps)
                 last_idx = int(total_steps)

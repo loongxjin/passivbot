@@ -2223,6 +2223,16 @@ async def _prepare_hlcvs_combined_impl(
     legacy_root: Path | None,
 ):
     market_settings_sources = market_settings_sources or {}
+    # Clamp end_ts to now so the OhlcvStore never fetches or pre-allocates
+    # chunks for timestamps that have not occurred yet.
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    if end_ts > now_ms:
+        logging.info(
+            "combined clamping fetch end_ts from %s to now %s",
+            ts_to_date(end_ts),
+            ts_to_date(now_ms),
+        )
+        end_ts = now_ms
     coins = effective_backtest_data_coins(config)
     orig_coins = list(coins)
     if ohlcv_exchanges is not None:

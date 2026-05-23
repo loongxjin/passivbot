@@ -196,6 +196,17 @@ def materialize_frames(
             )
         hlcvs[:, coin_idx, :] = aligned
         valid_mask = ~np.isnan(aligned[:, 0])
+        # Exclude stale tail: when OhlcvStore pre-allocates future-month chunks
+        # with placeholder data (vol=0, price frozen at last-known), the valid
+        # mask must NOT include these rows.  Find the last row with actual
+        # trading volume and trim any significant zero-volume tail.
+        vol_series = aligned[:, 3]
+        vol_gt_zero = vol_series > 0.0
+        if vol_gt_zero.any():
+            last_real = int(np.flatnonzero(vol_gt_zero)[-1])
+            zero_tail_len = len(vol_series) - last_real - 1
+            if zero_tail_len > 0:
+                valid_mask[last_real + 1:] = False
         if valid_mask.any():
             valid_indices = np.flatnonzero(valid_mask)
             first_valid_index = int(valid_indices[0])
