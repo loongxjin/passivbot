@@ -2225,7 +2225,9 @@ async def _prepare_hlcvs_combined_impl(
     market_settings_sources = market_settings_sources or {}
     # Clamp end_ts to now so the OhlcvStore never fetches or pre-allocates
     # chunks for timestamps that have not occurred yet.
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    # Must align to 1m boundary because OhlcvStore enforces timeframe alignment.
+    minute_ms = 60_000
+    now_ms = (int(datetime.now(timezone.utc).timestamp() * 1000) // minute_ms) * minute_ms
     if end_ts > now_ms:
         logging.info(
             "combined clamping fetch end_ts from %s to now %s",
@@ -2311,7 +2313,9 @@ async def _prepare_hlcvs_combined_impl(
     global_end_time = max(df.timestamp.iloc[-1] for df in chosen_data_per_coin.values())
 
     # Clamp end time to now to avoid issues when cached data or config extends into the future
-    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000)
+    # Must align to 1m boundary so the resulting timestamp grid stays on-bar.
+    minute_ms = 60_000
+    now_ms = (int(datetime.now(timezone.utc).timestamp() * 1000) // minute_ms) * minute_ms
     if global_end_time > now_ms:
         logging.warning(
             "global_end_time %s is in the future; clamping to current time %s",
