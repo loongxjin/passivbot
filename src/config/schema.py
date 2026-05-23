@@ -29,6 +29,7 @@ def get_template_config():
                 "filter_by_min_effective_cost": False,
                 "gap_tolerance_ohlcvs_minutes": 120,
                 "liquidation_threshold": 0.05,
+                "allow_liquidation_reset": False,
                 "maker_fee_override": 0.0004,
                 "market_settings_sources": {},
                 "max_warmup_minutes": 0,

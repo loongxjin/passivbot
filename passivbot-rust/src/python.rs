@@ -942,6 +942,7 @@ fn run_backtest_core<'py>(
             backtest.balance.use_btc_collateral,
             &backtest.total_wallet_exposures,
             backtest.liquidated(),
+            backtest.n_liquidations(),
         );
         analysis_usd.entry_initial_balance_pct_long = entry_pct_long;
         analysis_usd.entry_initial_balance_pct_short = entry_pct_short;
@@ -1320,6 +1321,11 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
             .map(|item| item.extract::<f64>())
             .transpose()?
             .unwrap_or(0.05),
+        allow_liquidation_reset: dict
+            .get_item("allow_liquidation_reset")?
+            .map(|item| item.extract::<bool>())
+            .transpose()?
+            .unwrap_or(false),
         equity_hard_stop_loss: hard_stop_cfg,
         market_orders_allowed: dict
             .get_item("market_orders_allowed")?

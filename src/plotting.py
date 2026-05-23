@@ -752,6 +752,7 @@ def create_forager_balance_figures(
     return_figures: bool | None = None,
     stride: int = 1,
     fast: bool = False,
+    liquidation_timestamps: list | None = None,
 ) -> dict:
     stride = max(1, int(stride)) if stride else 1
     df = bal_eq.iloc[::stride]
@@ -822,6 +823,17 @@ def create_forager_balance_figures(
             ax.set_title(title)
             ax.grid(True, linestyle="--", alpha=0.3)
             ax.legend()
+            # Draw red dashed vertical lines at liquidation points
+            liq_ts = liquidation_timestamps
+            if liq_ts is None and 'usd_total_equity' in df.columns:
+                # Auto-detect liquidation NaN markers in equity data
+                eq = pd.to_numeric(df['usd_total_equity'], errors='coerce')
+                nan_mask = eq.isna()
+                if nan_mask.any():
+                    liq_ts = df.index[nan_mask].tolist()
+            if liq_ts:
+                for ts in liq_ts:
+                    ax.axvline(x=ts, color='red', linestyle='--', linewidth=1.0, alpha=0.7)
         axes[-1].set_xlabel("Time")
         fig.tight_layout()
 

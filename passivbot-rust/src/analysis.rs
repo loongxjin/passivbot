@@ -997,6 +997,7 @@ pub fn analyze_backtest_pair(
     _use_btc_collateral: bool,
     total_wallet_exposures: &[f64],
     liquidated: bool,
+    n_liquidations: u32,
 ) -> (Analysis, Analysis) {
     let (long_pnl_sum, short_pnl_sum) =
         fills
@@ -1044,11 +1045,13 @@ pub fn analyze_backtest_pair(
     analysis_usd.pnl_ratio_long_short = long_short_profit_ratio;
     analysis_usd.long_short_profit_ratio = long_short_profit_ratio;
     analysis_usd.liquidated = liquidated;
+    analysis_usd.n_liquidations = n_liquidations;
 
     let mut analysis_btc = analysis_btc;
     analysis_btc.pnl_ratio_long_short = long_short_profit_ratio;
     analysis_btc.long_short_profit_ratio = long_short_profit_ratio;
     analysis_btc.liquidated = liquidated;
+    analysis_btc.n_liquidations = n_liquidations;
 
     (analysis_usd, analysis_btc)
 }
@@ -1792,7 +1795,7 @@ mod tests {
         let exposures_series: Vec<f64> = vec![];
 
         let (analysis_usd, analysis_btc) =
-            analyze_backtest_pair(&fills, &equities, false, &exposures_series, false);
+            analyze_backtest_pair(&fills, &equities, false, &exposures_series, false, 0);
 
         assert!(analysis_usd.adg > 0.0, "expected positive usd adg");
         assert!(analysis_btc.adg < 0.0, "expected negative btc adg");
@@ -1815,9 +1818,11 @@ mod tests {
         let exposures_series: Vec<f64> = vec![];
 
         let (analysis_usd, analysis_btc) =
-            analyze_backtest_pair(&fills, &equities, false, &exposures_series, true);
+            analyze_backtest_pair(&fills, &equities, false, &exposures_series, true, 1);
 
         assert!(analysis_usd.liquidated);
         assert!(analysis_btc.liquidated);
+        assert_eq!(analysis_usd.n_liquidations, 1);
+        assert_eq!(analysis_btc.n_liquidations, 1);
     }
 }

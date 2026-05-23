@@ -513,6 +513,8 @@ pub struct Backtest<'a> {
     peak_strategy_equity_series_pside: [Vec<f64>; 2],
     hard_stop_no_restart_peak_strategy_equity: f64,
     liquidated: bool,
+    n_liquidations: u32,
+    balance_snapshots: Vec<(usize, BalanceSnapshot)>,
     final_hard_stop_metrics: Option<HardStopMetrics>,
     final_strategy_equity_metrics: Option<StrategyEquityMetricsBundle>,
 }
@@ -1856,6 +1858,8 @@ impl<'a> Backtest<'a> {
             peak_strategy_equity_series_pside: [Vec::new(), Vec::new()],
             hard_stop_no_restart_peak_strategy_equity: 0.0,
             liquidated: false,
+            n_liquidations: 0,
+            balance_snapshots: Vec::new(),
             final_hard_stop_metrics: None,
             final_strategy_equity_metrics: None,
             // EMAs already initialized in `emas`; no rolling buffers needed
@@ -1864,6 +1868,10 @@ impl<'a> Backtest<'a> {
 
     pub fn liquidated(&self) -> bool {
         self.liquidated
+    }
+
+    pub fn n_liquidations(&self) -> u32 {
+        self.n_liquidations
     }
 
     pub fn run(&mut self) -> Result<(Vec<Fill>, Equities), String> {
@@ -1909,6 +1917,10 @@ impl<'a> Backtest<'a> {
                     );
                 }
             }
+            // Snapshot balance before fills when liquidation reset is enabled
+            if self.backtest_params.allow_liquidation_reset && self.equity_tracking_active {
+                self.save_balance_snapshot(k);
+            }
             self.check_for_fills(k);
             self.update_emas(k);
             self.update_rounded_balance(k);
@@ -1925,7 +1937,13 @@ impl<'a> Backtest<'a> {
                 self.update_equities(k);
                 if self.check_and_apply_liquidation(k) {
                     self.record_strategy_equity_sample();
-                    break;
+                    if self.backtest_params.allow_liquidation_reset {
+                        // Reset state and continue instead of breaking
+                        self.reset_after_liquidation(k);
+                        continue;
+                    } else {
+                        break;
+                    }
                 }
                 self.update_hard_stop_state(k)?;
                 self.record_hard_stop_tier_sample();
@@ -1990,6 +2008,153 @@ impl<'a> Backtest<'a> {
             *last_btc_equity = floor_usd.max(0.0) / btc_price;
         }
         true
+    }
+
+    /// Save a snapshot of the current balance state keyed by K-line index.
+    /// Called before `check_for_fills` each step when `allow_liquidation_reset` is enabled.
+    #[inline]
+    fn save_balance_snapshot(&mut self, k: usize) {
+        self.balance_snapshots.push((k, self.snapshot_balance()));
+    }
+
+    /// Reset account state after liquidation: restore balance to snapshot before
+    /// the earliest open position's entry, clear all positions and related state.
+    fn reset_after_liquidation(&mut self, k: usize) {
+        // Find the K-line index of the earliest currently-open position's entry fill.
+        // We scan fills to find entry fills whose cumulative qty has not been fully closed.
+        let entry_k = self.find_earliest_open_entry_k();
+
+        // Find the balance snapshot at or just before entry_k
+        let snapshot = if let Some(entry) = entry_k {
+            // Find snapshot with k <= entry_k, taking the one closest to entry_k
+            self.balance_snapshots
+                .iter()
+                .rev()
+                .find(|(snap_k, _)| *snap_k <= entry)
+                .map(|(_, snap)| *snap)
+        } else {
+            // No open positions — use the latest snapshot
+            self.balance_snapshots
+                .last()
+                .map(|(_, snap)| *snap)
+        };
+
+        if let Some(snap) = snapshot {
+            self.balance.usd_cash_wallet = snap.usd_cash_wallet;
+            self.balance.usd_total_balance = snap.usd_total_balance;
+            self.balance.usd_total_balance_rounded = snap.usd_total_balance_rounded;
+            self.balance.btc_cash_wallet = snap.btc_cash_wallet;
+            self.balance.btc_total_balance = snap.btc_total_balance;
+        }
+        // If no snapshot found, balance stays as-is (shouldn't happen in practice)
+
+        // Clear all positions
+        self.positions.long.clear();
+        self.positions.short.clear();
+
+        // Clear trailing prices
+        self.trailing_prices.long.clear();
+        self.trailing_prices.short.clear();
+
+        // Clear open orders (will be regenerated in next update_open_orders_all)
+        self.open_orders.long.clear();
+        self.open_orders.short.clear();
+
+        // Reset hard stop halted state for both psides
+        for pside in [LONG, SHORT] {
+            self.hard_stop_pside[pside].halted = false;
+            self.hard_stop_pside[pside].no_restart_latched = false;
+            self.hard_stop_pside[pside].cooldown_until_ms = None;
+            self.hard_stop_pside[pside].flat_confirmations = 0;
+            self.hard_stop_pside[pside].pending_stop = None;
+            self.hard_stop_pside[pside].state = None;
+            self.hard_stop_pside[pside].tier = ehsl::HardStopTier::default();
+            self.hard_stop_pside[pside].rolling_peak_strategy_pnl.clear();
+            self.hard_stop_pside[pside].current_red_start_ms = None;
+        }
+        self.hard_stop_halted = false;
+        self.hard_stop_no_restart_latched = false;
+        self.hard_stop_cooldown_until_ms = None;
+
+        // Push NaN to equities to mark the liquidation point for plotting
+        let ts = self.first_timestamp_ms + (k as u64) * self.interval_ms;
+        self.equities.timestamps_ms.push(ts);
+        self.equities.usd_total_equity.push(f64::NAN);
+        self.equities.btc_total_equity.push(f64::NAN);
+
+        // Then push the restored balance as the new equity starting point
+        self.equities.timestamps_ms.push(ts);
+        self.equities.usd_total_equity.push(self.balance.usd_total_balance);
+        let btc_price = self.btc_usd_prices[k].max(f64::EPSILON);
+        self.equities.btc_total_equity.push(self.balance.usd_total_balance / btc_price);
+
+        // Increment liquidation counter
+        self.n_liquidations += 1;
+
+        // Clear all balance snapshots after the restore point
+        // Keep only snapshots at k <= entry_k so we don't accumulate stale data
+        if let Some(entry) = entry_k {
+            self.balance_snapshots.retain(|(snap_k, _)| *snap_k <= entry);
+        }
+    }
+
+    /// Find the K-line index when the earliest currently-open position was entered.
+    /// Tracks cumulative entry/close fills per (coin_name, is_long) to determine
+    /// which positions are still open, then returns the K index of the earliest entry fill.
+    fn find_earliest_open_entry_k(&self) -> Option<usize> {
+        use std::collections::HashMap;
+
+        // (coin_name, is_long) -> (net_qty, first_entry_k)
+        let mut state: HashMap<(&str, bool), (f64, usize)> = HashMap::new();
+
+        for fill in &self.fills {
+            let is_long = fill.order_type.is_long();
+            let coin = fill.coin.as_str();
+            let key = (coin, is_long);
+
+            let is_entry = matches!(
+                fill.order_type,
+                OrderType::EntryInitialNormalLong
+                    | OrderType::EntryInitialPartialLong
+                    | OrderType::EntryTrailingNormalLong
+                    | OrderType::EntryTrailingCroppedLong
+                    | OrderType::EntryGridNormalLong
+                    | OrderType::EntryGridCroppedLong
+                    | OrderType::EntryGridInflatedLong
+                    | OrderType::EntryInitialNormalShort
+                    | OrderType::EntryInitialPartialShort
+                    | OrderType::EntryTrailingNormalShort
+                    | OrderType::EntryTrailingCroppedShort
+                    | OrderType::EntryGridNormalShort
+                    | OrderType::EntryGridCroppedShort
+                    | OrderType::EntryGridInflatedShort
+            );
+
+            if is_entry {
+                let entry = state.entry(key).or_insert((0.0, fill.index));
+                entry.0 += fill.fill_qty;
+                // Keep the earliest entry K
+                if fill.index < entry.1 {
+                    entry.1 = fill.index;
+                }
+            } else {
+                // Close fill: reduce net qty
+                if let Some(entry) = state.get_mut(&key) {
+                    entry.0 -= fill.fill_qty;
+                    // If position fully closed, remove tracking
+                    if entry.0.abs() < 1e-12 {
+                        state.remove(&key);
+                    }
+                }
+            }
+        }
+
+        // Among positions with non-zero net qty, find the earliest entry K
+        state
+            .iter()
+            .filter(|(_, (qty, _))| qty.abs() > 1e-12)
+            .map(|(_, (_, k))| *k)
+            .min()
     }
 
     fn update_n_positions_and_wallet_exposure_limits(&mut self, k: usize) -> bool {
@@ -4701,6 +4866,7 @@ mod tests {
             market_order_near_touch_threshold: 0.001,
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -4773,6 +4939,7 @@ mod tests {
             market_order_near_touch_threshold: 0.001,
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -4840,6 +5007,7 @@ mod tests {
             market_order_near_touch_threshold: 0.001,
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -4911,6 +5079,7 @@ mod tests {
             market_order_near_touch_threshold: 0.001,
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -4971,6 +5140,7 @@ mod tests {
             market_order_near_touch_threshold: 0.001,
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5050,6 +5220,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5139,6 +5310,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5221,6 +5393,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5298,6 +5471,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5373,6 +5547,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5440,6 +5615,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5508,6 +5684,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5589,6 +5766,7 @@ mod tests {
                 market_order_slippage_pct: 0.0005,
                 forager_score_hysteresis_pct: 0.0,
                 candle_interval_minutes: 1,
+                allow_liquidation_reset: false,
             };
 
             let mut bt = Backtest::new(
@@ -5666,6 +5844,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5760,6 +5939,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5837,6 +6017,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -5931,6 +6112,7 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bp_pair = BotParamsPair::default();
@@ -6047,6 +6229,7 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bp_pair = BotParamsPair::default();
@@ -6167,6 +6350,7 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bp_pair = BotParamsPair::default();
@@ -6258,6 +6442,7 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             equity_hard_stop_loss: EquityHardStopLossConfig::default(),
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -6359,6 +6544,7 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -6460,6 +6646,7 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -6550,6 +6737,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -6606,6 +6794,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -6662,6 +6851,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -6731,6 +6921,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -6798,6 +6989,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -6888,6 +7080,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -6981,6 +7174,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -7055,6 +7249,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -7161,6 +7356,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -7239,6 +7435,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -7319,6 +7516,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -7404,6 +7602,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -7493,6 +7692,7 @@ mod tests {
             market_order_near_touch_threshold: 0.001,
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(
@@ -7556,6 +7756,7 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
+            allow_liquidation_reset: false,
         };
 
         let mut bt = Backtest::new(

@@ -728,11 +728,13 @@ def execute_backtest(payload: BacktestPayload, config: dict):
         analysis_usd, analysis_btc, fills, equities_array, config
     )
     if bool(analysis.get("liquidated", False)):
+        n_liq = analysis.get("n_liquidations", 0)
         final_equity_usd = (
             float(equities_array[-1, 1]) if equities_array.size else float("nan")
         )
         logging.debug(
-            "Backtest liquidated early | final_equity_usd=%.6f | liquidation_threshold=%.6f",
+            "Backtest liquidated | n_liquidations=%d | final_equity_usd=%.6f | liquidation_threshold=%.6f",
+            n_liq,
             final_equity_usd,
             float(
                 get_optional_config_value(
@@ -1879,6 +1881,10 @@ def prep_backtest_args(
                 or 0.0
             ),
             "liquidation_threshold": liquidation_threshold,
+            "allow_liquidation_reset": bool(
+                get_optional_config_value(config, "backtest.allow_liquidation_reset", False)
+                or False
+            ),
         }
     return bot_params_list, exchange_params, backtest_params
 
