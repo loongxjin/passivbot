@@ -752,7 +752,7 @@ def create_forager_balance_figures(
     return_figures: bool | None = None,
     stride: int = 1,
     fast: bool = False,
-    liquidation_timestamps: list | None = None,
+    liquidation_info: list | None = None,
 ) -> dict:
     stride = max(1, int(stride)) if stride else 1
     df = bal_eq.iloc[::stride]
@@ -810,6 +810,18 @@ def create_forager_balance_figures(
         fig, axes = plt.subplots(2, 1, sharex=True, figsize=figsize)
         y_transform = (lambda arr: np.where(arr > 0.0, arr, np.nan)) if mode else (lambda arr: arr)
 
+        # Auto-detect liquidation timestamps from NaN markers or use provided info
+        liq_ts = None
+        liq_balances = None
+        if liquidation_info:
+            liq_ts = [ts for ts, _ in liquidation_info]
+            liq_balances = {ts: bal for ts, bal in liquidation_info}
+        elif 'usd_total_equity' in df.columns:
+            eq = pd.to_numeric(df['usd_total_equity'], errors='coerce')
+            nan_mask = eq.isna()
+            if nan_mask.any():
+                liq_ts = df.index[nan_mask].tolist()
+
         for ax, (title, series_specs), data in zip(axes, panel_configs, panel_data):
             ax.set_yscale("log" if mode else "linear")
             y_values = y_transform(data)
@@ -824,18 +836,39 @@ def create_forager_balance_figures(
             ax.grid(True, linestyle="--", alpha=0.3)
             ax.legend()
             # Draw red dashed vertical lines at liquidation points
-            liq_ts = liquidation_timestamps
-            if liq_ts is None and 'usd_total_equity' in df.columns:
-                # Auto-detect liquidation NaN markers in equity data
-                eq = pd.to_numeric(df['usd_total_equity'], errors='coerce')
-                nan_mask = eq.isna()
-                if nan_mask.any():
-                    liq_ts = df.index[nan_mask].tolist()
             if liq_ts:
                 for ts in liq_ts:
                     ax.axvline(x=ts, color='red', linestyle='--', linewidth=1.0, alpha=0.7)
         axes[-1].set_xlabel("Time")
-        fig.tight_layout()
+
+        # Add liquidation info text at the bottom of the figure
+        bottom_margin = 0.04
+        if liq_ts:
+            lines = []
+            for i, ts in enumerate(liq_ts, 1):
+                if hasattr(ts, 'strftime'):
+                    ts_str = ts.strftime('%Y-%m-%d %H:%M')
+                elif isinstance(ts, (int, float)):
+                    try:
+                        ts_str = pd.Timestamp(ts, unit='ms').strftime('%Y-%m-%d %H:%M')
+                    except Exception:
+                        ts_str = str(ts)
+                else:
+                    ts_str = str(ts)
+                if liq_balances and ts in liq_balances:
+                    peak = liq_balances[ts]
+                    lines.append(f"Liq #{i}: {ts_str} | peak {peak:,.0f}")
+                else:
+                    lines.append(f"Liq #{i}: {ts_str}")
+            if lines:
+                n_lines = len(lines)
+                annotation_text = '\n'.join(lines)
+                bottom_margin = max(0.04, 0.012 * n_lines)
+                fig.text(0.5, 0.002, annotation_text, ha='center', va='bottom',
+                         fontsize=7, color='red', style='italic',
+                         transform=fig.transFigure)
+
+        fig.tight_layout(rect=[0, bottom_margin, 1, 1])
 
         key = "balance_and_equity_logy" if mode else "balance_and_equity"
         if return_figures:

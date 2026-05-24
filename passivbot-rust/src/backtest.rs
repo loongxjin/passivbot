@@ -514,7 +514,6 @@ pub struct Backtest<'a> {
     hard_stop_no_restart_peak_strategy_equity: f64,
     liquidated: bool,
     n_liquidations: u32,
-    balance_snapshots: Vec<(usize, BalanceSnapshot)>,
     final_hard_stop_metrics: Option<HardStopMetrics>,
     final_strategy_equity_metrics: Option<StrategyEquityMetricsBundle>,
 }
@@ -1859,7 +1858,6 @@ impl<'a> Backtest<'a> {
             hard_stop_no_restart_peak_strategy_equity: 0.0,
             liquidated: false,
             n_liquidations: 0,
-            balance_snapshots: Vec::new(),
             final_hard_stop_metrics: None,
             final_strategy_equity_metrics: None,
             // EMAs already initialized in `emas`; no rolling buffers needed
@@ -1916,10 +1914,6 @@ impl<'a> Backtest<'a> {
                         self.coin_trade_start_idx[idx]
                     );
                 }
-            }
-            // Snapshot balance before fills when liquidation reset is enabled
-            if self.backtest_params.allow_liquidation_reset && self.equity_tracking_active {
-                self.save_balance_snapshot(k);
             }
             self.check_for_fills(k);
             self.update_emas(k);
@@ -2010,43 +2004,20 @@ impl<'a> Backtest<'a> {
         true
     }
 
-    /// Save a snapshot of the current balance state keyed by K-line index.
-    /// Called before `check_for_fills` each step when `allow_liquidation_reset` is enabled.
-    #[inline]
-    fn save_balance_snapshot(&mut self, k: usize) {
-        self.balance_snapshots.push((k, self.snapshot_balance()));
-    }
-
-    /// Reset account state after liquidation: restore balance to snapshot before
-    /// the earliest open position's entry, clear all positions and related state.
+    /// Reset account state after liquidation: restore balance to starting_balance,
+    /// clear all positions and related state, then continue from current K-line.
     fn reset_after_liquidation(&mut self, k: usize) {
-        // Find the K-line index of the earliest currently-open position's entry fill.
-        // We scan fills to find entry fills whose cumulative qty has not been fully closed.
-        let entry_k = self.find_earliest_open_entry_k();
-
-        // Find the balance snapshot at or just before entry_k
-        let snapshot = if let Some(entry) = entry_k {
-            // Find snapshot with k <= entry_k, taking the one closest to entry_k
-            self.balance_snapshots
-                .iter()
-                .rev()
-                .find(|(snap_k, _)| *snap_k <= entry)
-                .map(|(_, snap)| *snap)
+        let starting = self.backtest_params.starting_balance.max(0.0);
+        self.balance.usd_cash_wallet = starting;
+        self.balance.usd_total_balance = starting;
+        self.balance.usd_total_balance_rounded = starting;
+        self.balance.btc_cash_wallet = 0.0;
+        if self.balance.use_btc_collateral {
+            let btc_price = self.btc_usd_prices[k].max(f64::EPSILON);
+            self.balance.btc_total_balance = starting / btc_price;
         } else {
-            // No open positions — use the latest snapshot
-            self.balance_snapshots
-                .last()
-                .map(|(_, snap)| *snap)
-        };
-
-        if let Some(snap) = snapshot {
-            self.balance.usd_cash_wallet = snap.usd_cash_wallet;
-            self.balance.usd_total_balance = snap.usd_total_balance;
-            self.balance.usd_total_balance_rounded = snap.usd_total_balance_rounded;
-            self.balance.btc_cash_wallet = snap.btc_cash_wallet;
-            self.balance.btc_total_balance = snap.btc_total_balance;
+            self.balance.btc_total_balance = 0.0;
         }
-        // If no snapshot found, balance stays as-is (shouldn't happen in practice)
 
         // Clear all positions
         self.positions.long.clear();
@@ -2083,78 +2054,14 @@ impl<'a> Backtest<'a> {
         self.equities.btc_total_equity.push(f64::NAN);
 
         // Then push the restored balance as the new equity starting point
-        self.equities.timestamps_ms.push(ts);
+        // Use ts + 1 to avoid duplicate-index dropping in Python post-processing
+        self.equities.timestamps_ms.push(ts + 1);
         self.equities.usd_total_equity.push(self.balance.usd_total_balance);
         let btc_price = self.btc_usd_prices[k].max(f64::EPSILON);
         self.equities.btc_total_equity.push(self.balance.usd_total_balance / btc_price);
 
         // Increment liquidation counter
         self.n_liquidations += 1;
-
-        // Clear all balance snapshots after the restore point
-        // Keep only snapshots at k <= entry_k so we don't accumulate stale data
-        if let Some(entry) = entry_k {
-            self.balance_snapshots.retain(|(snap_k, _)| *snap_k <= entry);
-        }
-    }
-
-    /// Find the K-line index when the earliest currently-open position was entered.
-    /// Tracks cumulative entry/close fills per (coin_name, is_long) to determine
-    /// which positions are still open, then returns the K index of the earliest entry fill.
-    fn find_earliest_open_entry_k(&self) -> Option<usize> {
-        use std::collections::HashMap;
-
-        // (coin_name, is_long) -> (net_qty, first_entry_k)
-        let mut state: HashMap<(&str, bool), (f64, usize)> = HashMap::new();
-
-        for fill in &self.fills {
-            let is_long = fill.order_type.is_long();
-            let coin = fill.coin.as_str();
-            let key = (coin, is_long);
-
-            let is_entry = matches!(
-                fill.order_type,
-                OrderType::EntryInitialNormalLong
-                    | OrderType::EntryInitialPartialLong
-                    | OrderType::EntryTrailingNormalLong
-                    | OrderType::EntryTrailingCroppedLong
-                    | OrderType::EntryGridNormalLong
-                    | OrderType::EntryGridCroppedLong
-                    | OrderType::EntryGridInflatedLong
-                    | OrderType::EntryInitialNormalShort
-                    | OrderType::EntryInitialPartialShort
-                    | OrderType::EntryTrailingNormalShort
-                    | OrderType::EntryTrailingCroppedShort
-                    | OrderType::EntryGridNormalShort
-                    | OrderType::EntryGridCroppedShort
-                    | OrderType::EntryGridInflatedShort
-            );
-
-            if is_entry {
-                let entry = state.entry(key).or_insert((0.0, fill.index));
-                entry.0 += fill.fill_qty;
-                // Keep the earliest entry K
-                if fill.index < entry.1 {
-                    entry.1 = fill.index;
-                }
-            } else {
-                // Close fill: reduce net qty
-                if let Some(entry) = state.get_mut(&key) {
-                    entry.0 -= fill.fill_qty;
-                    // If position fully closed, remove tracking
-                    if entry.0.abs() < 1e-12 {
-                        state.remove(&key);
-                    }
-                }
-            }
-        }
-
-        // Among positions with non-zero net qty, find the earliest entry K
-        state
-            .iter()
-            .filter(|(_, (qty, _))| qty.abs() > 1e-12)
-            .map(|(_, (_, k))| *k)
-            .min()
     }
 
     fn update_n_positions_and_wallet_exposure_limits(&mut self, k: usize) -> bool {

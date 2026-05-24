@@ -2060,12 +2060,40 @@ def post_process(
     dump_backtest_dataset_metadata(config, exchange, results_path)
     fdf.to_csv(f"{results_path}fills.csv")
     bal_eq.to_csv(oj(results_path, "balance_and_equity.csv.gz"), compression="gzip")
+    # Compute liquidation info: peak balance per "life", merged by calendar day
+    liquidation_info = None
+    if equities_array.size > 0 and equities_array.shape[1] >= 2:
+        eq_col = equities_array[:, 1]
+        nan_mask = np.isnan(eq_col)
+        if nan_mask.any():
+            raw_ts = equities_array[nan_mask, 0].astype(np.int64)
+            liq_dts = pd.to_datetime(raw_ts, unit="ms")
+            bal_series = bal_eq["usd_total_balance"]
+            # Group consecutive liquidations by calendar day, take max peak per day
+            from itertools import groupby
+            raw_info = []
+            prev_ts = bal_eq.index[0]
+            for liq_ts in liq_dts:
+                mask = (bal_eq.index >= prev_ts) & (bal_eq.index <= liq_ts)
+                segment = bal_series.loc[mask]
+                peak = float(segment.max()) if len(segment) > 0 and not segment.isna().all() else 0.0
+                raw_info.append((liq_ts, peak, prev_ts))
+                prev_ts = liq_ts
+            # Merge same-day entries
+            merged = []
+            for _, group in groupby(raw_info, key=lambda x: x[0].date()):
+                group_list = list(group)
+                best_peak = max(p for _, p, _ in group_list)
+                ts = group_list[-1][0]  # last timestamp of the day
+                merged.append((ts, best_peak))
+            liquidation_info = merged
     if "balance" not in disabled_plot_groups:
         balance_figs = create_forager_balance_figures(
             bal_eq,
             include_logy=True,
             autoplot=False,
             return_figures=True,
+            liquidation_info=liquidation_info,
         )
         save_figures(balance_figs, results_path)
     if "twe" not in disabled_plot_groups:
