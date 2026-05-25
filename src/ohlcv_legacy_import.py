@@ -137,6 +137,6 @@ def import_legacy_range_into_store(
         mask = (ts >= int(start_ts)) & (ts <= int(end_ts))
         if not mask.any():
             continue
-        store.write_rows(exchange, timeframe, symbol, ts[mask], values[mask])
+        store.write_rows(exchange, timeframe, symbol, ts[mask], values[mask], skip_valid=True)
         imported_rows += int(mask.sum())
     return imported_rows

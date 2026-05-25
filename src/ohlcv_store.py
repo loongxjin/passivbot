@@ -148,6 +148,7 @@ class OhlcvStore:
         values: np.ndarray,
         *,
         status: str = "open",
+        skip_valid: bool = False,
     ) -> None:
         ts_arr = np.asarray(timestamps_ms, dtype=np.int64)
         val_arr = np.asarray(values, dtype=np.float32)
@@ -175,6 +176,8 @@ class OhlcvStore:
             valid = np.load(paths.valid_path, mmap_mode="r+")
             for src_idx in indices:
                 offset = month_offset(int(ts_arr[src_idx]), year, month, timeframe)
+                if skip_valid and valid[offset]:
+                    continue
                 body[offset] = val_arr[src_idx]
                 valid[offset] = True
             body.flush()

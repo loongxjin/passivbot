@@ -1371,7 +1371,25 @@ def save_coins_hlcvs_to_cache(
             existing_meta = json.load(open(meta_path))
             existing_warmup = int(existing_meta.get("warmup_minutes", 0))
             if existing_warmup >= warmup_minutes:
-                return cache_dir
+                # Warmup is sufficient, but also check if the new data is fresher.
+                # When end_date="now" the effective end shifts every minute; if we
+                # skip the save the cache stays stale and every subsequent run
+                # triggers a full re-fetch.
+                if timestamps is not None and len(timestamps) > 0:
+                    new_end = int(timestamps[-1])
+                    old_end = int(existing_meta.get("last_ts", 0))
+                    if new_end > old_end:
+                        logging.info(
+                            f"Cache warmup sufficient but data is fresher "
+                            f"(new_end={ts_to_date(new_end)} vs "
+                            f"old_end={ts_to_date(old_end)}). Overwriting cache."
+                        )
+                        # Fall through to save.
+                    else:
+                        logging.debug("Cache is up-to-date, skipping save.")
+                        return cache_dir
+                else:
+                    return cache_dir
         except Exception:
             pass
     logging.info(f"Dumping cache...")
@@ -1418,7 +1436,10 @@ def save_coins_hlcvs_to_cache(
         f"{line}"
     )
     logging.info(f"Seconds to dump cache: {(utc_ms() - sts) / 1000:.4f}")
-    json.dump({"warmup_minutes": warmup_minutes}, open(meta_path, "w"))
+    meta = {"warmup_minutes": warmup_minutes}
+    if timestamps is not None and len(timestamps) > 0:
+        meta["last_ts"] = int(timestamps[-1])
+    json.dump(meta, open(meta_path, "w"))
     return cache_dir
 
 

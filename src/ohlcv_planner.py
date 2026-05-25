@@ -55,9 +55,25 @@ def plan_local_symbol_range(
         and int(bounds[0]) <= int(start_ts)
         and int(bounds[1]) >= int(end_ts)
     )
+    # When end_ts is clamped to "now", the v2 store will always be a few
+    # minutes/hours behind.  Treat the store as complete if the start is
+    # fully covered and the end gap is within tolerance (1 day).  This
+    # avoids a full legacy re-import when only a small incremental fetch
+    # is needed.
+    _ONE_DAY_MS = 86_400_000
+    near_complete = False
+    if not store_complete and bounds[0] is not None and bounds[1] is not None:
+        start_ok = int(bounds[0]) <= int(start_ts)
+        end_gap = int(end_ts) - int(bounds[1])
+        if start_ok and 0 < end_gap <= _ONE_DAY_MS:
+            near_complete = True
     persistent_gaps = tuple(
         catalog.get_persistent_gaps(exchange, timeframe, symbol, start_ts, end_ts)
     )
+    # Only promote to store_complete if there are no persistent gaps that
+    # need legacy import to fill.
+    if near_complete and not persistent_gaps:
+        store_complete = True
     legacy_inspection = None
     if (
         (not store_complete or persistent_gaps)
