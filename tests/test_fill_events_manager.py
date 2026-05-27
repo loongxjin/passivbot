@@ -31,6 +31,7 @@ from src.fill_events_manager import (
     PnlObservation,
     GAP_REASON_FETCH_FAILED,
     KUCOIN_POSITION_HISTORY_LOOKAHEAD_MS,
+    apply_hyperliquid_raw_psize_overrides,
     compute_psize_pprice,
     custom_id_to_snake,
     ensure_qty_signage,
@@ -2425,8 +2426,8 @@ async def test_manager_reconciles_cycle_pnl_without_leaving_synthetic_anchor(
 
     events = manager.get_events(symbol="TON/USDT:USDT")
     by_id = {ev.id: ev for ev in events}
-    assert by_id["partial-close"].pnl == pytest.approx(-8.0)
-    assert by_id["final-close"].pnl == pytest.approx(13.0)
+    assert by_id["partial-close"].pnl == pytest.approx(-7.6)
+    assert by_id["final-close"].pnl == pytest.approx(12.6)
     assert sum(ev.pnl for ev in events if "close" in ev.pb_order_type) == pytest.approx(5.0)
     assert by_id["partial-close"].pnl_source == fem.PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
     assert by_id["final-close"].pnl_source == fem.PNL_SOURCE_AUTHORITATIVE_CYCLE_RECONCILED
@@ -3783,6 +3784,48 @@ def test_kucoin_position_history_observation_preserves_cycle_scope():
     assert obs.close_size == pytest.approx(3.5)
 
 
+def test_kucoin_trade_reconstruction_uses_raw_contract_multiplier():
+    ts = 1_700_000_000_000
+    trades = [
+        {
+            "id": "entry",
+            "timestamp": ts,
+            "symbol": "ZEC/USDT:USDT",
+            "side": "buy",
+            "qty": 100.0,
+            "price": 600.0,
+            "position_side": "long",
+            "raw": [
+                {
+                    "source": "fetch_my_trades",
+                    "data": {"info": {"value": "600.0"}},
+                }
+            ],
+        },
+        {
+            "id": "close",
+            "timestamp": ts + 60_000,
+            "symbol": "ZEC/USDT:USDT",
+            "side": "sell",
+            "qty": 100.0,
+            "price": 610.0,
+            "position_side": "long",
+            "raw": [
+                {
+                    "source": "fetch_my_trades",
+                    "data": {"info": {"value": "610.0"}},
+                }
+            ],
+        },
+    ]
+
+    pnls, final_positions = fem.compute_realized_pnls_from_trades(trades)
+
+    assert pnls["entry"] == pytest.approx(0.0)
+    assert pnls["close"] == pytest.approx(10.0)
+    assert final_positions[("ZEC/USDT:USDT", "long")] == pytest.approx((0.0, 0.0))
+
+
 @pytest.mark.asyncio
 async def test_kucoin_fetcher_emits_observations_without_mutating_fill_pnl(monkeypatch):
     fetcher = KucoinFetcher(api=object())
@@ -4804,3 +4847,70 @@ def test_compute_psize_pprice_initial_state():
     # VWAP: (2*100 + 1*120) / 3 = 320/3 ≈ 106.67
     assert abs(events[0]["pprice"] - 106.66666666666667) < 0.01
     assert result[("BTC", "long")] == (3.0, events[0]["pprice"])
+
+
+def test_hyperliquid_raw_start_position_overrides_wrong_reconstructed_psize():
+    events = [
+        {
+            "id": "hl-close",
+            "timestamp": 1779396722362,
+            "symbol": "HYPE/USDC:USDC",
+            "side": "sell",
+            "qty": 496.4,
+            "price": 56.663393493150686,
+            "pnl": -548.82307,
+            "position_side": "long",
+            "raw": [
+                {
+                    "source": "fetch_my_trades",
+                    "data": {
+                        "id": "5",
+                        "side": "sell",
+                        "amount": 12.45,
+                        "price": 56.64,
+                        "pnl": -13.8,
+                        "info": {
+                            "tid": "5",
+                            "side": "sell",
+                            "sz": "12.45",
+                            "px": "56.64",
+                            "closedPnl": "-13.8",
+                            "startPosition": "12.45",
+                            "dir": "Close Long",
+                        },
+                    },
+                },
+                {
+                    "source": "fetch_my_trades",
+                    "data": {
+                        "id": "1",
+                        "side": "sell",
+                        "amount": 119.0,
+                        "price": 56.66,
+                        "pnl": -131.5,
+                        "info": {
+                            "tid": "1",
+                            "side": "sell",
+                            "sz": "119",
+                            "px": "56.66",
+                            "closedPnl": "-131.5",
+                            "startPosition": "496.4",
+                            "dir": "Close Long",
+                        },
+                    },
+                },
+            ],
+        }
+    ]
+    ensure_qty_signage(events)
+    compute_psize_pprice(
+        events,
+        {("HYPE/USDC:USDC", "long"): (739.53, 56.79734)},
+    )
+
+    assert events[0]["psize"] == pytest.approx(243.13)
+
+    apply_hyperliquid_raw_psize_overrides(events)
+
+    assert events[0]["psize"] == 0.0
+    assert events[0]["pprice"] == 0.0
