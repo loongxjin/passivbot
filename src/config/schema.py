@@ -1,6 +1,6 @@
 from copy import deepcopy
 
-CONFIG_SCHEMA_VERSION = "v7.11.0"
+CONFIG_SCHEMA_VERSION = "v7.12.0"
 DEFAULT_EXAMPLE_CONFIG_PATH = "configs/examples/default_trailing_grid_long_npos7.json"
 
 
@@ -28,11 +28,12 @@ def get_template_config():
                 "exchanges": ["binance", "bybit"],
                 "filter_by_min_effective_cost": False,
                 "gap_tolerance_ohlcvs_minutes": 120,
+                "hlcvs_data_dir": None,
+                "hlcvs_data_override_mode": "intersection",
                 "liquidation_threshold": 0.05,
                 "allow_liquidation_reset": False,
                 "maker_fee_override": 0.0004,
                 "market_settings_sources": {},
-                "max_warmup_minutes": 0,
                 "ohlcv_source_dir": None,
                 "market_order_slippage_pct": 0.0005,
                 "visible_metrics": None,
@@ -347,6 +348,7 @@ def get_template_config():
                 "balance_hysteresis_snap_pct": 0.01,
                 "balance_override": None,
                 "candle_lock_timeout_seconds": 10,
+                "custom_endpoints_path": None,
                 "defer_broad_candle_warmup": True,
                 "enable_archive_candle_fetch": False,
                 "execution_delay_seconds": 2,

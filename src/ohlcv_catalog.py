@@ -11,6 +11,9 @@ def _utc_ms() -> int:
     return int(time.time() * 1000)
 
 
+KNOWN_GAP_RETRY_MS = 7 * 24 * 60 * 60 * 1000
+
+
 @dataclass(frozen=True)
 class ChunkRecord:
     exchange: str
@@ -202,7 +205,7 @@ class OhlcvCatalog:
                     rows = excluded.rows,
                     status = excluded.status,
                     schema_version = excluded.schema_version,
-                    checksum = excluded.checksum,
+                    checksum = COALESCE(excluded.checksum, chunks.checksum),
                     updated_at = excluded.updated_at
                 """,
                 (
@@ -254,6 +257,11 @@ class OhlcvCatalog:
         next_retry_at: int | None = None,
         note: str | None = None,
     ) -> None:
+        now = _utc_ms()
+        if persistent and last_attempt_at is None:
+            last_attempt_at = now
+        if persistent and next_retry_at is None:
+            next_retry_at = now + KNOWN_GAP_RETRY_MS
         with self._connect() as conn:
             conn.execute(
                 """
@@ -262,12 +270,29 @@ class OhlcvCatalog:
                     retry_count, last_attempt_at, next_retry_at, note
                 ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(exchange, timeframe, symbol, start_ts, end_ts) DO UPDATE SET
-                    reason = excluded.reason,
-                    persistent = excluded.persistent,
-                    retry_count = excluded.retry_count,
-                    last_attempt_at = excluded.last_attempt_at,
-                    next_retry_at = excluded.next_retry_at,
-                    note = excluded.note
+                    reason = CASE
+                        WHEN gaps.persistent AND NOT excluded.persistent
+                        THEN gaps.reason ELSE excluded.reason
+                    END,
+                    persistent = CASE
+                        WHEN gaps.persistent OR excluded.persistent THEN 1 ELSE 0
+                    END,
+                    retry_count = CASE
+                        WHEN gaps.persistent AND NOT excluded.persistent
+                        THEN gaps.retry_count ELSE excluded.retry_count
+                    END,
+                    last_attempt_at = CASE
+                        WHEN gaps.persistent AND NOT excluded.persistent
+                        THEN gaps.last_attempt_at ELSE excluded.last_attempt_at
+                    END,
+                    next_retry_at = CASE
+                        WHEN gaps.persistent AND NOT excluded.persistent
+                        THEN gaps.next_retry_at ELSE excluded.next_retry_at
+                    END,
+                    note = CASE
+                        WHEN gaps.persistent AND NOT excluded.persistent
+                        THEN gaps.note ELSE excluded.note
+                    END
                 """,
                 (
                     exchange,
@@ -323,6 +348,94 @@ class OhlcvCatalog:
             for gap in self.get_gaps(exchange, timeframe, symbol, start_ts, end_ts)
             if gap.persistent
         ]
+
+    def clear_gap_range(
+        self,
+        *,
+        exchange: str,
+        timeframe: str,
+        symbol: str,
+        start_ts: int,
+        end_ts: int,
+        reason: str | None = None,
+    ) -> int:
+        """Remove an interval from matching gap records, preserving outside ranges."""
+        start_ts = int(start_ts)
+        end_ts = int(end_ts)
+        if end_ts < start_ts:
+            return 0
+        interval_ms = 60_000 if str(timeframe) == "1m" else 1
+        gaps = self.get_gaps(exchange, timeframe, symbol, start_ts, end_ts)
+        changed = 0
+        with self._connect() as conn:
+            for gap in gaps:
+                if reason is not None and str(gap.reason) != str(reason):
+                    continue
+                gap_start = int(gap.start_ts)
+                gap_end = int(gap.end_ts)
+                if gap_end < start_ts or gap_start > end_ts:
+                    continue
+                conn.execute(
+                    """
+                    DELETE FROM gaps
+                    WHERE exchange = ? AND timeframe = ? AND symbol = ?
+                      AND start_ts = ? AND end_ts = ?
+                    """,
+                    (exchange, timeframe, symbol, gap_start, gap_end),
+                )
+                changed += 1
+                remainders = []
+                if gap_start < start_ts:
+                    remainders.append((gap_start, start_ts - interval_ms))
+                if gap_end > end_ts:
+                    remainders.append((end_ts + interval_ms, gap_end))
+                for rem_start, rem_end in remainders:
+                    if rem_start > rem_end:
+                        continue
+                    conn.execute(
+                        """
+                        INSERT INTO gaps(
+                            exchange, timeframe, symbol, start_ts, end_ts, reason, persistent,
+                            retry_count, last_attempt_at, next_retry_at, note
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        ON CONFLICT(exchange, timeframe, symbol, start_ts, end_ts) DO UPDATE SET
+                            reason = excluded.reason,
+                            persistent = CASE
+                                WHEN gaps.persistent OR excluded.persistent THEN 1 ELSE 0
+                            END,
+                            retry_count = CASE
+                                WHEN excluded.retry_count > gaps.retry_count
+                                THEN excluded.retry_count ELSE gaps.retry_count
+                            END,
+                            last_attempt_at = CASE
+                                WHEN gaps.last_attempt_at IS NULL THEN excluded.last_attempt_at
+                                WHEN excluded.last_attempt_at IS NULL THEN gaps.last_attempt_at
+                                WHEN excluded.last_attempt_at > gaps.last_attempt_at
+                                THEN excluded.last_attempt_at ELSE gaps.last_attempt_at
+                            END,
+                            next_retry_at = CASE
+                                WHEN gaps.next_retry_at IS NULL THEN excluded.next_retry_at
+                                WHEN excluded.next_retry_at IS NULL THEN gaps.next_retry_at
+                                WHEN excluded.next_retry_at < gaps.next_retry_at
+                                THEN excluded.next_retry_at ELSE gaps.next_retry_at
+                            END,
+                            note = COALESCE(gaps.note, excluded.note)
+                        """,
+                        (
+                            gap.exchange,
+                            gap.timeframe,
+                            gap.symbol,
+                            int(rem_start),
+                            int(rem_end),
+                            gap.reason,
+                            int(bool(gap.persistent)),
+                            int(gap.retry_count),
+                            gap.last_attempt_at,
+                            gap.next_retry_at,
+                            gap.note,
+                        ),
+                    )
+        return changed
 
     def record_fetch_attempt(
         self,

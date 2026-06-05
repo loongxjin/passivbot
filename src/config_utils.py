@@ -223,6 +223,15 @@ FIELD_RUNTIME_RULES = {
             "optimize": "Backtest Runtime",
         },
     },
+    "live.max_warmup_minutes": {
+        "owner": "live",
+        "consumed_by": {"live", "backtest", "optimize"},
+        "cli_exposed_on": {"live", "backtest", "optimize"},
+        "help_group": {
+            "backtest": "Date Range",
+            "optimize": "Backtest Runtime",
+        },
+    },
     "live.pnls_max_lookback_days": {
         "owner": "live",
         "consumed_by": {"live", "backtest", "optimize"},
@@ -1018,6 +1027,28 @@ RESERVED_CLI_ARGS = {
         },
         "help": "Backtest candle interval in minutes.",
     },
+    "backtest.hlcvs_data_dir": {
+        "visible": ["--hlcvs-data-dir"],
+        "hidden": ["--backtest.hlcvs_data_dir", "--backtest_hlcvs_data_dir"],
+        "type": str,
+        "metavar": "PATH",
+        "commands": {"backtest"},
+        "group": {"backtest": "Backtest Runtime"},
+        "help": "Use a specific final HLCV dataset directory instead of resolving by config hash.",
+    },
+    "backtest.hlcvs_data_override_mode": {
+        "visible": ["--hlcvs-data-override-mode"],
+        "hidden": [
+            "--backtest.hlcvs_data_override_mode",
+            "--backtest_hlcvs_data_override_mode",
+        ],
+        "type": str,
+        "metavar": "MODE",
+        "commands": {"backtest"},
+        "group": {"backtest": "Backtest Runtime"},
+        "choices": ("intersection", "dataset"),
+        "help": "How --hlcvs-data-dir chooses coins/range: intersection or dataset.",
+    },
     "backtest.starting_balance": {
         "visible": ["--starting-balance", "-sb"],
         "hidden": ["--backtest.starting_balance", "--backtest_starting_balance"],
@@ -1240,7 +1271,6 @@ def _classify_backtest_argument(full_name: str, help_all: bool) -> Optional[str]
     }
     date_range = {
         "backtest.end_date",
-        "backtest.max_warmup_minutes",
         "backtest.start_date",
     }
     runtime = {
@@ -1304,7 +1334,6 @@ def _classify_optimize_argument(full_name: str, help_all: bool) -> Optional[str]
         "backtest.filter_by_min_effective_cost",
         "backtest.gap_tolerance_ohlcvs_minutes",
         "backtest.maker_fee_override",
-        "backtest.max_warmup_minutes",
         "backtest.ohlcv_source_dir",
         "backtest.starting_balance",
         "backtest.volume_normalization",

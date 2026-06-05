@@ -1,6 +1,9 @@
 # Backtesting
 
-Passivbot ships with a backtester that replays historical 1 minute candles. When a coin isn't cached locally, the backtester fetches data from the exchange archives and caches it under `caches/ohlcv/` for reuse.
+Passivbot ships with a backtester that replays historical 1 minute candles. The
+backtester prepares data from the canonical v2 OHLCV store under `caches/ohlcvs/`.
+When data is missing there, it imports any matching legacy daily shards before making
+targeted remote exchange requests.
 
 Backtesting requires the full install profile:
 
@@ -8,7 +11,9 @@ Backtesting requires the full install profile:
 python3 -m pip install -e ".[full]"
 ```
 
-> **GateIO cache note:** If you have existing GateIO OHLCV data in `caches/ohlcv/gateio`, delete the folder after upgrading to the new data strategy so fresh data (normalized to base volume) is fetched.
+> **GateIO cache note:** If you have existing legacy GateIO OHLCV data in
+> `caches/ohlcv/gateio`, delete the folder before a fresh run so Passivbot rebuilds the
+> v2 store with base-volume-normalized data.
 
 > **GateIO history note:** GateIO's public 1m OHLCV endpoint only serves a recent window of roughly 10,000 candles. Older GateIO backtests need `backtest.ohlcv_source_dir` data or candles sourced from another exchange; Passivbot marks older GateIO 1m spans unavailable instead of repeatedly retrying rejected requests.
 
@@ -59,12 +64,56 @@ The workspace includes `config`, `analysis`, `fills`, `balance_and_equity`, `hlc
 `timestamps`, `btc_usd_prices`, `coins`, `market_settings`, `candles_for_coin`, and
 `plot_fills_for_coin`.
 
+## HLCV Data Contract
+
+Backtest and optimize data preparation follows one deterministic order:
+
+1. read existing v2 chunks in `caches/ohlcvs/`
+2. import matching legacy raw OHLCV shards when they are present
+3. fetch only the remaining missing or invalid windows from the exchange
+
+Missing exchange history is recorded as coverage metadata rather than treated as cache
+corruption. Newly listed coins may start after the requested start date, and delisted
+or migrated coins may end before the requested end date. Small verified source-side
+internal gaps may be filled within `backtest.gap_tolerance_ohlcvs_minutes`; larger
+internal gaps are repaired or excluded from the returned tradable window rather than
+materialized as one continuous tradable span. Backtests still fail when there is no
+usable data inside the requested range, no BTC benchmark data, no tradable candles
+after warmup, missing/mismatched chunk checksums, conflicting duplicate candles, or
+malformed timestamps/OHLCV rows that cannot be normalized.
+
+Prepared final caches under `caches/hlcvs_data/` require a valid manifest. Old
+manifest-less final caches are rebuilt. Explicit `backtest.hlcvs_data_dir` override
+datasets also require valid manifests and checksums.
+
+### Override final HLCV datasets
+
+Use `backtest.hlcvs_data_dir` or `--hlcvs-data-dir` to replay a specific prepared
+dataset under `caches/hlcvs_data/` instead of resolving the dataset from the current
+config hash. Override datasets are accepted only when their manifest verifies every
+required artifact: `hlcvs`, `timestamps`, `btc_usd_prices`, `coins`, and
+`market_specific_settings`.
+
+`backtest.hlcvs_data_override_mode` controls how the current config is matched to
+the override dataset:
+
+- `intersection` (default): keep the current config's requested coins and date
+  window, clipped to the verified override dataset where necessary. This is the
+  conservative mode for rerunning a strategy against a known cache without
+  expanding the universe from the cache contents.
+- `dataset`: adopt the override dataset's effective coins and timestamp window.
+  This is useful for exact artifact replay when the cache itself should define the
+  run universe and date range.
+
 ## Backtest CLI args
 
 - `-dp` to disable individual coin plotting.
 - `--suite [y/n]` to override `backtest.suite_enabled` (omit the value to enable, e.g. `--suite`).
 - `--scenarios label1,label2,...` to run only specific scenarios by label (implies `--suite y`).
 - `--suite-config path/to/overrides.json` to merge an additional suite definition onto the base config. Useful when you want to keep suite definitions outside the main config file.
+- `--hlcvs-data-dir path/to/cache` to replay a verified final HLCV dataset.
+- `--hlcvs-data-override-mode intersection|dataset` to choose whether the current
+  config or the override dataset defines the effective coin/date universe.
 
 The canonical default profile keeps `backtest.suite_enabled = false`. A normal backtest run is
 therefore a single run unless you explicitly enable suite mode in the config or via `--suite`.
@@ -118,7 +167,10 @@ Top-level suite keys (directly under `backtest`):
 - `scenarios`: list of scenario dictionaries
 - `aggregate`: how to combine per-scenario metrics (default: `{"default": "mean"}`)
 
-During a suite run Passivbot prepares one master OHLCV dataset that spans the union of all scenario date ranges and coins, then slices it per scenario so repeated downloads are avoided. Results are written to:
+During a suite run Passivbot prepares master OHLCV datasets only for the scenario
+windows that consume them. The combined dataset uses the union of combined scenarios;
+single-exchange datasets use the union of scenarios restricted to that exchange. Results
+are written to:
 
 ```
 backtests/suite_runs/<timestamp>/<scenario_label>/
@@ -137,7 +189,7 @@ The data strategy is determined implicitly by the number of exchanges configured
 - **Single exchange** (1 exchange in `backtest.exchanges`): Data is fetched from that exchange only. Scenario labels include the exchange suffix (e.g., `base/binance`).
 - **Combined exchanges** (>1 exchanges): Data is combined from all listed exchanges, selecting the best feed per coin based on coverage and quality. Scenario labels do not include an exchange suffix.
 
-Per-scenario `exchanges` overrides can narrow down which exchanges a scenario sees, but cannot add exchanges not in the base config.
+Per-scenario `exchanges` overrides can narrow down which exchanges a scenario sees and can also require extra exchanges that are not listed in the top-level base config. Passivbot expands the prepared dataset set to include every scenario-required exchange before running the suite.
 
 ### Comparing Exchanges
 
@@ -179,11 +231,16 @@ The backtester supports OHLCV data from the following exchanges:
 - **binance** - Binance USDT-M Futures
 - **bybit** - Bybit USDT Perpetuals
 - **bitget** - Bitget USDT Perpetuals
-- **gateio** - Gate.io USDT Perpetuals
+- **gateio** - Gate.io USDT Perpetuals, with the public-history window caveat above
+
+Experimental or narrower-coverage sources:
+
+- **kucoin** - KuCoin Futures archive/CCXT data path. Use `kucoin` in configs and cache paths; Passivbot converts to CCXT's `kucoinfutures` ID internally. Treat KuCoin backtest data as experimental until your intended coins/date windows pass a real data smoke.
+- **hyperliquid** - Supported for live and metadata paths; broader historical backtest coverage depends on the available candle source for the requested market universe.
 
 The canonical default template currently uses `binance` and `bybit`. Add `bitget` and/or `gateio`
 explicitly in `backtest.exchanges` when you want them included.
 
 ## Exchange Name Conventions
 
-Cache paths and output directories use standard exchange names (e.g., `binance`, `bybit`, `gateio`). The ccxt-specific suffixes (`binanceusdm`, `bybitusdt`) are only used internally when communicating with the exchange API. Always use the short names in your configuration files.
+Cache paths and output directories use standard exchange names (e.g., `binance`, `bybit`, `gateio`, `kucoin`). CCXT-specific IDs such as `binanceusdm`, `bybitusdt`, and `kucoinfutures` are only used internally when communicating with exchange APIs. Always use the short names in your configuration files and external OHLCV source directories.

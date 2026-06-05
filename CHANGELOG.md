@@ -4,6 +4,30 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Added `passivbot tool ohlcvs-doctor` to audit v2 OHLCV chunk caches and
+  rebuild `caches/ohlcvs/catalog.sqlite` metadata from copied `data/` chunks.
+- Fixed live bots so non-shutdown `asyncio.CancelledError` failures from CCXT
+  account-state or candle fetches are logged, counted, and routed through the
+  existing restart/backoff path instead of silently exiting without countdown.
+- Backtest and optimizer runs now automatically clean stale `caches/ohlcvs/materialized/`
+  scratch payloads while preserving materialized directories locked by active processes.
+- `live.custom_endpoints_path` is now part of the canonical config schema, so normalized
+  live configs preserve endpoint override files instead of dropping the documented setting.
+- Updated user-facing docs for current CLI logging flags, custom endpoint setup,
+  backtest exchange naming, suite exchange expansion, uncovered tool commands, and
+  current Forager/indicator wording.
+- Fixed Hyperliquid `xyz:*` stock-perp backtest/optimizer startup so explicit
+  `backtest.ohlcv_source_dir` data can use the direct source-dir preparation path when
+  strict local v2 materialization is unavailable.
+
+## v7.12.0 - 2026-05-27
+
+- Changed backtest/optimizer HLCV preparation to treat normal market availability limits as coverage metadata: late coin starts and unavailable tails are logged and persisted in artifacts instead of aborting the whole run; large internal gaps are repaired or excluded from the tradable window so synthetic spans do not become tradable. Corruption, malformed candles, missing BTC benchmark data, and no tradable candles still fail loudly.
+- Final `caches/hlcvs_data/` caches now require valid manifests and old manifest-less final caches rebuild by default; explicit override datasets require valid manifests/checksums.
+- Added per-coin HLCV coverage metadata to materialized datasets, including requested range, valid start/end, leading/trailing missing minutes, internal gap counts/windows, and synthetic fill count/source.
+- Fixed strict v2 HLCV materialization so a leading invalid prefix is accepted as pre-inception when the first valid candle matches authoritative first-timestamp metadata, even if an older persistent gap starts inside that prefix.
+- Fixed strict v2 HLCV gap cleanup so overlapping persistent pre-inception records no longer crash materialization with a SQLite unique-constraint error while normalizing authoritative first-candle boundaries.
+- Fixed suite HLCV preparation so individual exchange datasets use the date windows of the scenarios that consume them instead of inheriting the global combined-suite window.
 - Capped omega-ratio analysis metrics at a finite value when a backtest has positive returns with no losing days, and reports flat/no-movement windows as `0.0`, preventing optimizer scoring metrics from disappearing during JSON/Python aggregation.
 - Added canonical strategy-equity recovery-duration metrics: `strategy_eq_recovery_days_mean`, `strategy_eq_recovery_days_median`, `strategy_eq_recovery_days_p95`, `strategy_eq_recovery_days_p99`, `strategy_eq_recovery_days_mean_worst_5pct`, `strategy_eq_recovery_days_mean_worst_1pct`, and `strategy_eq_recovery_days_max`; `peak_recovery_days_strategy_eq` remains as a backwards-compatible alias for the max.
 - Changed pymoo NSGA-II optimization so `optimize.population_size: null` now auto-resolves to `250`, avoiding startup failures when `optimize.pymoo.algorithm: "auto"` selects NSGA-II for small objective sets.
