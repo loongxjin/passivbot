@@ -2573,11 +2573,10 @@ async def test_resolve_v2_store_range_refetches_corrupt_chunk(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_resolve_v2_store_range_repairs_missing_checksum_chunk(tmp_path):
+async def test_resolve_v2_store_range_auto_fills_missing_checksum_no_remote_fetch(tmp_path):
     catalog = OhlcvCatalog(tmp_path / "caches" / "ohlcvs" / "catalog.sqlite")
     store = OhlcvStore(tmp_path / "caches" / "ohlcvs", catalog)
     start = month_start_ts(2026, 4)
-    month_end = month_end_ts(2026, 4, "1m")
     ts = np.array([start, start + 60_000], dtype=np.int64)
     initial = np.array([[101.0, 99.0, 100.0, 10.0], [102.0, 100.0, 101.0, 11.0]], dtype=np.float32)
     store.write_rows("binance", "1m", "ETH/USDT:USDT", ts, initial)
@@ -2623,11 +2622,11 @@ async def test_resolve_v2_store_range_repairs_missing_checksum_chunk(tmp_path):
 
     assert rng is not None
     np.testing.assert_allclose(rng.values, initial)
-    assert manager.calls == [(int(start), int(month_end))]
+    # Missing checksum should be auto-filled locally — no remote fetch needed
+    assert manager.calls == []
+    # Checksum should now be stored
     chunk = catalog.list_chunks("binance", "1m", "ETH/USDT:USDT", int(ts[0]), int(ts[-1]))[0]
-    assert chunk.checksum
-    gaps = catalog.get_gaps("binance", "1m", "ETH/USDT:USDT", int(start), int(month_end))
-    assert any(gap.reason == "local_corrupt_chunk" for gap in gaps)
+    assert chunk.checksum is not None
 
 
 @pytest.mark.asyncio

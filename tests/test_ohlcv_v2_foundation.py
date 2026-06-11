@@ -116,7 +116,7 @@ def test_store_detects_same_process_mutation_after_verified_read(tmp_path):
         store.read_range("binance", "1m", "BTC/USDT", int(ts[0]), int(ts[-1]))
 
 
-def test_store_rejects_missing_chunk_checksum_on_read(tmp_path):
+def test_store_auto_fills_missing_chunk_checksum_on_read(tmp_path):
     catalog = OhlcvCatalog(tmp_path / "caches" / "ohlcvs" / "catalog.sqlite")
     store = OhlcvStore(tmp_path / "caches" / "ohlcvs", catalog)
 
@@ -130,10 +130,15 @@ def test_store_rejects_missing_chunk_checksum_on_read(tmp_path):
     chunk_before = catalog.list_chunks("binance", "1m", "BTC/USDT", int(ts[0]), int(ts[-1]))[0]
     assert chunk_before.checksum is None
 
-    with pytest.raises(ValueError, match="checksum missing"):
-        store.read_range("binance", "1m", "BTC/USDT", int(ts[0]), int(ts[-1]))
+    # Should auto-compute checksum instead of raising
+    rng = store.read_range("binance", "1m", "BTC/USDT", int(ts[0]), int(ts[-1]))
+    assert rng is not None
+
     chunk_after = catalog.list_chunks("binance", "1m", "BTC/USDT", int(ts[0]), int(ts[-1]))[0]
-    assert chunk_after.checksum is None
+    assert chunk_after.checksum is not None
+    # Data unchanged
+    assert rng.values.shape == (2, 4)
+    assert rng.valid.sum() == 2
 
 
 def test_open_month_patch_extends_existing_chunk_and_symbol_bounds(tmp_path):
