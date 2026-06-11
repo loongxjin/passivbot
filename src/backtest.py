@@ -2011,6 +2011,12 @@ def prep_backtest_args(
                 get_optional_config_value(config, "backtest.allow_liquidation_reset", False)
                 or False
             ),
+            "day_drop_cooldown_pct": float(
+                get_optional_config_value(config, "backtest.day_drop_cooldown_pct", 0.0) or 0.0
+            ),
+            "day_drop_cooldown_minutes": int(
+                get_optional_config_value(config, "backtest.day_drop_cooldown_minutes", 0) or 0
+            ),
         }
     return bot_params_list, exchange_params, backtest_params
 
@@ -2201,6 +2207,10 @@ def post_process(
         )
     else:
         sanitized_config = sanitize_prepared_config_for_dump(config)
+    # Inject resolved backtest params that have defaults
+    bt_cfg = sanitized_config.setdefault("backtest", {})
+    bt_cfg.setdefault("day_drop_cooldown_pct", float(bt_cfg.get("day_drop_cooldown_pct", 0.0) or 0.0))
+    bt_cfg.setdefault("day_drop_cooldown_minutes", int(bt_cfg.get("day_drop_cooldown_minutes", 0) or 0))
     dump_config(sanitized_config, f"{results_path}config.json")
     dump_backtest_dataset_metadata(config, exchange, results_path)
     fdf.to_csv(f"{results_path}fills.csv")

@@ -1374,6 +1374,16 @@ fn backtest_params_from_dict(dict: &PyDict) -> PyResult<BacktestParams> {
             .map(|item| item.extract::<u64>())
             .transpose()?
             .unwrap_or(1), // default to 1m candles
+        day_drop_cooldown_pct: dict
+            .get_item("day_drop_cooldown_pct")?
+            .map(|item| item.extract::<f64>())
+            .transpose()?
+            .unwrap_or(0.0),
+        day_drop_cooldown_minutes: dict
+            .get_item("day_drop_cooldown_minutes")?
+            .map(|item| item.extract::<u64>())
+            .transpose()?
+            .unwrap_or(0),
     })
 }
 

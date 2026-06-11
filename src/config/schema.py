@@ -32,6 +32,8 @@ def get_template_config():
                 "hlcvs_data_override_mode": "intersection",
                 "liquidation_threshold": 0.05,
                 "allow_liquidation_reset": False,
+                "day_drop_cooldown_pct": 0.0,
+                "day_drop_cooldown_minutes": 0,
                 "maker_fee_override": 0.0004,
                 "market_settings_sources": {},
                 "ohlcv_source_dir": None,
