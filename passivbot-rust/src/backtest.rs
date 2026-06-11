@@ -481,7 +481,8 @@ pub struct Backtest<'a> {
     hard_stop_no_restart_latched: bool,
     hard_stop_cooldown_until_ms: Option<u64>,
     hard_stop_flat_confirmations: usize,
-    day_drop_global_cooldown_until_ms: Option<u64>, // global day-drop cooldown expiry
+    day_drop_twe_trigger_day_ms: u64, // UTC midnight of day when TWE shrink triggered, 0=none
+    twe_long_original: f64,           // saved original total_wallet_exposure_limit for long
     hard_stop_pending_stop: Option<HardStopStopSnapshot>,
     hard_stop_last_stop: Option<HardStopStopSnapshot>,
     hard_stop_n_triggers: u32,
@@ -1115,61 +1116,6 @@ impl<'a> Backtest<'a> {
                         mode_short = Some(orchestrator::TradingMode::GracefulStop);
                     }
                 }
-                // Day-drop cooldown: global pause if ANY coin dropped too much today
-                if self.backtest_params.day_drop_cooldown_pct > 0.0
-                    && self.backtest_params.day_drop_cooldown_minutes > 0
-                {
-                    let current_ts_for_dd =
-                        self.first_timestamp_ms + (k as u64) * self.interval_ms;
-                    // Expire stale global cooldown
-                    if let Some(cooldown_until) = self.day_drop_global_cooldown_until_ms {
-                        if current_ts_for_dd >= cooldown_until {
-                            self.day_drop_global_cooldown_until_ms = None;
-                        }
-                    }
-                    // Check day drop for all coins, trigger global cooldown if any exceed threshold
-                    if self.day_drop_global_cooldown_until_ms.is_none() {
-                        let day_start_ms =
-                            (current_ts_for_dd / 86_400_000) * 86_400_000;
-                        if day_start_ms >= self.first_timestamp_ms {
-                            let day_start_k =
-                                ((day_start_ms - self.first_timestamp_ms) / self.interval_ms)
-                                    as usize;
-                            for ci in 0..self.n_coins {
-                                if self.coin_is_valid_at(ci, k) {
-                                    let day_open = self
-                                        .hlcvs_value(day_start_k, self.active_coin_indices[ci], CLOSE)
-                                        .max(f64::EPSILON);
-                                    let price_idx = k.clamp(
-                                        self.coin_first_valid_idx[ci],
-                                        self.coin_last_valid_idx[ci],
-                                    );
-                                    let cp = self.hlcvs_value(price_idx, self.active_coin_indices[ci], CLOSE)
-                                        .max(f64::EPSILON);
-                                    let day_drop = (cp - day_open) / day_open;
-                                    if day_drop <= -self.backtest_params.day_drop_cooldown_pct {
-                                        let cooldown_ms =
-                                            self.backtest_params.day_drop_cooldown_minutes * 60_000;
-                                        self.day_drop_global_cooldown_until_ms =
-                                            Some(current_ts_for_dd + cooldown_ms);
-                                        eprintln!(
-                                            "[DAY-DROP] GLOBAL PAUSE: {} day_drop={:.1}% >= threshold={:.1}%, cooldown +{}min",
-                                            self.backtest_params.coins[ci],
-                                            day_drop * 100.0,
-                                            self.backtest_params.day_drop_cooldown_pct * 100.0,
-                                            self.backtest_params.day_drop_cooldown_minutes,
-                                        );
-                                        break;
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    // Block all coins without position during global cooldown
-                    if self.day_drop_global_cooldown_until_ms.is_some() && pos_long.size == 0.0 {
-                        mode_long = Some(orchestrator::TradingMode::GracefulStop);
-                    }
-                }
                 self.apply_hard_stop_mode_overrides(
                     &mut mode_long,
                     &mut mode_short,
@@ -1468,49 +1414,6 @@ impl<'a> Backtest<'a> {
                     mode_short = Some(orchestrator::TradingMode::GracefulStop);
                 }
             }
-            // Day-drop cooldown: global pause
-            if self.backtest_params.day_drop_cooldown_pct > 0.0
-                && self.backtest_params.day_drop_cooldown_minutes > 0
-            {
-                let current_ts = self.first_timestamp_ms + (k as u64) * self.interval_ms;
-                if let Some(cooldown_until) = self.day_drop_global_cooldown_until_ms {
-                    if current_ts >= cooldown_until {
-                        self.day_drop_global_cooldown_until_ms = None;
-                    }
-                }
-                if self.day_drop_global_cooldown_until_ms.is_none() {
-                    let day_start_ms = (current_ts / 86_400_000) * 86_400_000;
-                    if day_start_ms >= self.first_timestamp_ms {
-                        let day_start_k = ((day_start_ms - self.first_timestamp_ms)
-                            / self.interval_ms) as usize;
-                        for ci in 0..self.n_coins {
-                            if self.coin_is_valid_at(ci, k) {
-                                let day_open = self
-                                    .hlcvs_value(day_start_k, self.active_coin_indices[ci], CLOSE)
-                                    .max(f64::EPSILON);
-                                let price_idx = k.clamp(
-                                    self.coin_first_valid_idx[ci],
-                                    self.coin_last_valid_idx[ci],
-                                );
-                                let cp = self
-                                    .hlcvs_value(price_idx, self.active_coin_indices[ci], CLOSE)
-                                    .max(f64::EPSILON);
-                                let day_drop = (cp - day_open) / day_open;
-                                if day_drop <= -self.backtest_params.day_drop_cooldown_pct {
-                                    let cooldown_ms =
-                                        self.backtest_params.day_drop_cooldown_minutes * 60_000;
-                                    self.day_drop_global_cooldown_until_ms =
-                                        Some(current_ts + cooldown_ms);
-                                    break;
-                                }
-                            }
-                        }
-                    }
-                }
-                if self.day_drop_global_cooldown_until_ms.is_some() && pos_long.size == 0.0 {
-                    mode_long = Some(orchestrator::TradingMode::GracefulStop);
-                }
-            }
             self.apply_hard_stop_mode_overrides(
                 &mut mode_long,
                 &mut mode_short,
@@ -1768,6 +1671,7 @@ impl<'a> Backtest<'a> {
         let mut bot_params_master = bot_params[0].clone();
         bot_params_master.long.n_positions = n_coins.min(bot_params_master.long.n_positions);
         bot_params_master.short.n_positions = n_coins.min(bot_params_master.short.n_positions);
+        let twe_long_original = bot_params_master.long.total_wallet_exposure_limit;
 
         // Store original bot params to preserve dynamic WEL indicators
         let bot_params_original = bot_params.clone();
@@ -1923,7 +1827,8 @@ impl<'a> Backtest<'a> {
             hard_stop_halted: false,
             hard_stop_no_restart_latched: false,
             hard_stop_cooldown_until_ms: None,
-            day_drop_global_cooldown_until_ms: None,
+            day_drop_twe_trigger_day_ms: 0,
+            twe_long_original: twe_long_original,
             hard_stop_flat_confirmations: 0,
             hard_stop_pending_stop: None,
             hard_stop_last_stop: None,
@@ -2229,6 +2134,52 @@ impl<'a> Backtest<'a> {
         // avoid division by zero (possible directly after a delisting)
         if self.effective_n_positions.long == 0 && self.effective_n_positions.short == 0 {
             return false;
+        }
+
+        // ---------- 2.5. day-drop TWE shrink ----------
+        let twe_shrink_enabled = self.backtest_params.day_drop_twe_threshold_pct > 0.0
+            && self.backtest_params.day_drop_twe_multiplier > 0.0
+            && self.backtest_params.day_drop_twe_multiplier < 1.0;
+        if twe_shrink_enabled {
+            let current_ts = self.first_timestamp_ms + (k as u64) * self.interval_ms;
+            let today_ms = (current_ts / 86_400_000) * 86_400_000;
+            // New day: reset trigger
+            if self.day_drop_twe_trigger_day_ms != today_ms {
+                self.day_drop_twe_trigger_day_ms = 0;
+            }
+            // Scan for trigger if not yet triggered today
+            if self.day_drop_twe_trigger_day_ms == 0
+                && today_ms >= self.first_timestamp_ms
+            {
+                let day_start_k =
+                    ((today_ms - self.first_timestamp_ms) / self.interval_ms) as usize;
+                for ci in 0..self.n_coins {
+                    if !self.coin_is_valid_at(ci, k) {
+                        continue;
+                    }
+                    let col = self.active_coin_indices[ci];
+                    let day_open =
+                        self.hlcvs_value(day_start_k, col, CLOSE).max(f64::EPSILON);
+                    let price_idx =
+                        k.clamp(self.coin_first_valid_idx[ci], self.coin_last_valid_idx[ci]);
+                    let cp = self.hlcvs_value(price_idx, col, CLOSE).max(f64::EPSILON);
+                    let day_drop = (cp - day_open) / day_open;
+                    if day_drop <= -self.backtest_params.day_drop_twe_threshold_pct {
+                        self.day_drop_twe_trigger_day_ms = today_ms;
+                        break;
+                    }
+                }
+            }
+            if self.day_drop_twe_trigger_day_ms == today_ms {
+                self.bot_params_master
+                    .long
+                    .total_wallet_exposure_limit =
+                    self.twe_long_original * self.backtest_params.day_drop_twe_multiplier;
+            } else {
+                self.bot_params_master
+                    .long
+                    .total_wallet_exposure_limit = self.twe_long_original;
+            }
         }
 
         // ---------- 3. dynamic WELs ----------

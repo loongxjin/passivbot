@@ -980,6 +980,16 @@ class Passivbot:
         self._min_effective_cost_summary_log_interval_ms = 60 * 60 * 1000
         self._orchestrator_prev_close_ema = {}
         self._orchestrator_close_ema_fallback_counts = {}
+        self._day_drop_twe_trigger_day = 0  # UTC midnight of last trigger day, 0=none
+        self._original_twe_long = float(
+            get_optional_config_value(config, "bot.long.total_wallet_exposure_limit", 0.0) or 0.0
+        )
+        self._day_drop_twe_threshold_pct = float(
+            get_optional_live_value(config, "day_drop_twe_threshold_pct", 0.0) or 0.0
+        )
+        self._day_drop_twe_multiplier = float(
+            get_optional_live_value(config, "day_drop_twe_multiplier", 0.0) or 0.0
+        )
         self.hsl = self._parse_hsl_config()
         self._runtime_forced_modes = {"long": {}, "short": {}}
         self._equity_hard_stop_supervisor_running = False
@@ -11155,6 +11165,63 @@ class Passivbot:
             log_ranges_long,
         )
 
+    async def _apply_day_drop_twe_shrink(self, last_prices: dict[str, float]) -> float:
+        """Check day-drop for all approved coins. Return effective TWE (shrunk if triggered)."""
+        twe = self._original_twe_long
+        threshold = self._day_drop_twe_threshold_pct
+        multiplier = self._day_drop_twe_multiplier
+        if threshold <= 0.0 or multiplier <= 0.0 or multiplier >= 1.0 or twe <= 0.0:
+            return twe
+
+        now_ms = utc_ms()
+        today_ms = (now_ms // 86_400_000) * 86_400_000
+        if self._day_drop_twe_trigger_day != today_ms:
+            self._day_drop_twe_trigger_day = 0
+
+        if self._day_drop_twe_trigger_day == 0:
+            # Scan ALL approved coins — a coin you're not trading can still
+            # signal market-wide stress.
+            approved = set()
+            for pside in ("long", "short"):
+                coins = getattr(self, "approved_coins_minus_ignored_coins", {}).get(pside, set())
+                approved.update(coins)
+            for symbol in sorted(approved):
+                current = last_prices.get(symbol)
+                if current is None or current <= 0.0:
+                    continue
+                try:
+                    candles = await self.candle_manager.get_candles(
+                        symbol,
+                        start_ts=today_ms,
+                        end_ts=now_ms,
+                        max_age_ms=60_000,
+                        allow_remote_fetch=False,
+                    )
+                except Exception:
+                    continue
+                if candles is None or len(candles) == 0:
+                    continue
+                day_open = float(candles[0]["o"])
+                if day_open <= 0.0:
+                    continue
+                day_drop = (current - day_open) / day_open
+                if day_drop <= -threshold:
+                    self._day_drop_twe_trigger_day = today_ms
+                    logging.info(
+                        "[day-drop-twe] %s day_drop=%.1f%% >= threshold=%.1f%%, "
+                        "shrinking TWE %.1f -> %.1f for rest of day",
+                        symbol,
+                        day_drop * 100.0,
+                        threshold * 100.0,
+                        twe,
+                        twe * multiplier,
+                    )
+                    break
+
+        if self._day_drop_twe_trigger_day == today_ms:
+            return twe * multiplier
+        return twe
+
     async def calc_ideal_orders_orchestrator(self, *, return_snapshot: bool = False):
         """Compute desired orders using Rust orchestrator (JSON API)."""
         self._current_planning_snapshot = None
@@ -11213,10 +11280,13 @@ class Passivbot:
         realized_pnl_cumsum = self._get_realized_pnl_cumsum_stats()
         max_realized_loss_pct = float(self.live_value("max_realized_loss_pct") or 1.0)
 
+        effective_twe_long = await self._apply_day_drop_twe_shrink(last_prices)
         global_bp = {
             "long": self._bot_params_to_rust_dict("long", None),
             "short": self._bot_params_to_rust_dict("short", None),
         }
+        if effective_twe_long != self._original_twe_long:
+            global_bp["long"]["total_wallet_exposure_limit"] = effective_twe_long
         # Effective hedge_mode = config setting AND exchange capability.
         # If either is False, we block same-coin hedging in the orchestrator.
         effective_hedge_mode = self._config_hedge_mode and self.hedge_mode

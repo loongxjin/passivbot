@@ -233,8 +233,8 @@ pub struct BacktestParams {
     pub market_order_slippage_pct: f64,
     pub forager_score_hysteresis_pct: f64,
     pub candle_interval_minutes: u64, // 1 for 1m candles (default), 5 for 5m, etc.
-    pub day_drop_cooldown_pct: f64,   // 0.0 = disabled; e.g. 0.10 = skip coin if day drop >= 10%
-    pub day_drop_cooldown_minutes: u64, // 0 = disabled; cooldown after triggering
+    pub day_drop_twe_threshold_pct: f64, // 0.0 = disabled; e.g. 0.10 = any coin day drop >= 10%
+    pub day_drop_twe_multiplier: f64,    // e.g. 0.1 = shrink TWE to 10% when triggered
 }
 
 #[derive(Default, Debug, Clone, Copy, Serialize, Deserialize)]
