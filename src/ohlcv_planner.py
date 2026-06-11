@@ -71,12 +71,16 @@ def plan_local_symbol_range(
         catalog.get_persistent_gaps(exchange, timeframe, symbol, start_ts, end_ts)
     )
     # Only promote to store_complete if there are no persistent gaps that
-    # need legacy import to fill.
-    if near_complete and not persistent_gaps:
+    # need legacy import to fill.  pre_inception gaps are historical markers
+    # and do not indicate missing data within the requested range.
+    substantive_gaps = tuple(
+        g for g in persistent_gaps if str(g.reason) != "pre_inception"
+    )
+    if near_complete and not substantive_gaps:
         store_complete = True
     legacy_inspection = None
     if (
-        (not store_complete or persistent_gaps)
+        not store_complete
         and legacy_root is not None
         and Path(legacy_root).exists()
     ):
@@ -88,14 +92,14 @@ def plan_local_symbol_range(
             start_ts=start_ts,
             end_ts=end_ts,
         )
-    if persistent_gaps and not (
+    if store_complete:
+        status = "store_complete"
+    elif persistent_gaps and not (
         legacy_inspection is not None and legacy_inspection.all_days_present
     ):
         status = "blocked_by_persistent_gap"
     elif legacy_inspection is not None and legacy_inspection.all_days_present:
         status = "legacy_importable"
-    elif store_complete:
-        status = "store_complete"
     else:
         status = "missing_local"
     return SymbolRangePlan(

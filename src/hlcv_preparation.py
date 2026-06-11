@@ -1326,26 +1326,31 @@ async def _resolve_v2_store_range(
             ts_to_date(end_ts),
         )
     elif plan.blocked_by_persistent_gap and plan.legacy_inspection is not None:
-        # Even when legacy data doesn't fully cover the persistent gap,
-        # import whatever is available so the valid window starts earlier.
-        imported_rows = import_legacy_range_into_store(
-            store=store,
-            legacy_root=legacy_root,
-            exchange=exchange,
-            timeframe="1m",
-            symbol=symbol,
-            start_ts=start_ts,
-            end_ts=end_ts,
+        # Only attempt legacy import when there are substantive (non-pre_inception)
+        # persistent gaps to fill.  pre_inception gaps are historical boundaries
+        # that cannot be filled by re-importing.
+        has_substantive_gaps = any(
+            str(g.reason) != "pre_inception" for g in plan.persistent_gaps
         )
-        if imported_rows > 0:
-            logging.info(
-                "[%s] imported %d partial-coverage legacy 1m rows into v2 store for %s (%s -> %s)",
-                exchange,
-                imported_rows,
-                coin,
-                ts_to_date(start_ts),
-                ts_to_date(end_ts),
+        if has_substantive_gaps:
+            imported_rows = import_legacy_range_into_store(
+                store=store,
+                legacy_root=legacy_root,
+                exchange=exchange,
+                timeframe="1m",
+                symbol=symbol,
+                start_ts=start_ts,
+                end_ts=end_ts,
             )
+            if imported_rows > 0:
+                logging.info(
+                    "[%s] imported %d partial-coverage legacy 1m rows into v2 store for %s (%s -> %s)",
+                    exchange,
+                    imported_rows,
+                    coin,
+                    ts_to_date(start_ts),
+                    ts_to_date(end_ts),
+                )
     rng = await _read_v2_range_repairing_corrupt_chunk(
         om=om,
         catalog=catalog,

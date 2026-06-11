@@ -225,31 +225,34 @@ class OhlcvStore:
             self._invalidate_verified_checksum_cache(paths.body_path)
             body = np.load(paths.body_path, mmap_mode="r+")
             valid = np.load(paths.valid_path, mmap_mode="r+")
+            wrote_any = False
             for src_idx in indices:
                 offset = month_offset(int(ts_arr[src_idx]), year, month, timeframe)
                 if skip_valid and valid[offset]:
                     continue
                 body[offset] = val_arr[src_idx]
                 valid[offset] = True
+                wrote_any = True
             body.flush()
             valid.flush()
             del body
             del valid
-            checksum = self._compute_chunk_checksum(paths)
-            self.catalog.register_chunk(
-                exchange=exchange,
-                timeframe=timeframe,
-                symbol=symbol,
-                year=year,
-                month=month,
-                body_path=str(paths.body_path.resolve()),
-                valid_path=str(paths.valid_path.resolve()),
-                start_ts=month_start_ts(year, month),
-                end_ts=month_end_ts(year, month, timeframe),
-                rows=rows_in_month(year, month, timeframe),
-                status=status,
-                checksum=checksum,
-            )
+            if wrote_any:
+                checksum = self._compute_chunk_checksum(paths)
+                self.catalog.register_chunk(
+                    exchange=exchange,
+                    timeframe=timeframe,
+                    symbol=symbol,
+                    year=year,
+                    month=month,
+                    body_path=str(paths.body_path.resolve()),
+                    valid_path=str(paths.valid_path.resolve()),
+                    start_ts=month_start_ts(year, month),
+                    end_ts=month_end_ts(year, month, timeframe),
+                    rows=rows_in_month(year, month, timeframe),
+                    status=status,
+                    checksum=checksum,
+                )
 
         self.catalog.upsert_symbol_bounds(exchange, timeframe, symbol, int(ts_arr.min()), int(ts_arr.max()))
 
