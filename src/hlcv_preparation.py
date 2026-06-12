@@ -1326,13 +1326,10 @@ async def _resolve_v2_store_range(
             ts_to_date(end_ts),
         )
     elif plan.blocked_by_persistent_gap and plan.legacy_inspection is not None:
-        # Only attempt legacy import when there are substantive (non-pre_inception)
-        # persistent gaps to fill.  pre_inception gaps are historical boundaries
-        # that cannot be filled by re-importing.
-        has_substantive_gaps = any(
-            str(g.reason) != "pre_inception" for g in plan.persistent_gaps
-        )
-        if has_substantive_gaps:
+        # Import legacy data on the FIRST encounter for this gap only.
+        # Subsequent runs will already have the partial coverage in the v2
+        # store (bounds non-None), so skip to avoid redundant file iteration.
+        if plan.bounds[0] is None and plan.bounds[1] is None:
             imported_rows = import_legacy_range_into_store(
                 store=store,
                 legacy_root=legacy_root,

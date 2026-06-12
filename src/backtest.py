@@ -1410,14 +1410,47 @@ def save_coins_hlcvs_to_cache(
     meta_path = cache_dir / "cache_meta.json"
     if meta_path.exists() and not force_overwrite:
         try:
-            existing_meta = json.load(open(meta_path))
-            existing_warmup = int(existing_meta.get("warmup_minutes", 0))
             existing_manifest = load_hlcvs_manifest(cache_dir)
-            if existing_warmup >= warmup_minutes and manifest_has_required_schema(
-                existing_manifest
-            ):
+            if not manifest_has_required_schema(existing_manifest):
+                pass  # fall through to overwrite
+            else:
                 verify_hlcvs_manifest(cache_dir, existing_manifest)
-                return cache_dir
+                # Check if new data extends meaningfully further than cached data.
+                # If the cached timestamps end more than one day before the new
+                # data does, overwrite so the stale-detection guard in the loader
+                # won't reject the cache on the next run.
+                new_end_ts = int(timestamps[-1]) if timestamps is not None and len(timestamps) > 0 else 0
+                cache_ts_artifact = None
+                try:
+                    ts_files = existing_manifest.get("files", {})
+                    ts_entry = ts_files.get("timestamps") if isinstance(ts_files, dict) else None
+                    if ts_entry and isinstance(ts_entry, dict):
+                        cache_ts_artifact = cache_dir / str(ts_entry["path"])
+                except Exception:
+                    cache_ts_artifact = None
+                if cache_ts_artifact is None:
+                    cache_ts_artifact = cache_dir / "timestamps.npy.gz"
+                cached_end_ts = 0
+                if cache_ts_artifact.exists():
+                    try:
+                        cached_ts = load_numpy_artifact(cache_ts_artifact)
+                        if cached_ts is not None and len(cached_ts) > 0:
+                            cached_end_ts = int(cached_ts[-1])
+                    except Exception:
+                        cached_end_ts = 0
+                one_day_ms = 86_400_000
+                if new_end_ts > cached_end_ts + one_day_ms:
+                    logging.info(
+                        "[hlcvs] cache data is stale: cached_end=%s new_end=%s — overwriting",
+                        ts_to_date(cached_end_ts) if cached_end_ts > 0 else "unknown",
+                        ts_to_date(new_end_ts) if new_end_ts > 0 else "unknown",
+                    )
+                    # fall through to overwrite
+                else:
+                    existing_meta = json.load(open(meta_path))
+                    existing_warmup = int(existing_meta.get("warmup_minutes", 0))
+                    if existing_warmup >= warmup_minutes:
+                        return cache_dir
         except (HlcvsManifestError, OSError, TypeError, ValueError) as exc:
             logging.warning(
                 "[hlcvs] existing cache %s failed validation; overwriting: %s",
