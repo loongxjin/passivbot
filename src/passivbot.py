@@ -11271,7 +11271,7 @@ class Passivbot:
                 approved.update(coins)
             if not approved:
                 return twe
-            all_prices = await self.candle_manager.get_last_prices(
+            all_prices = await self.cm.get_last_prices(
                 list(approved), max_age_ms=60_000
             )
             for symbol in sorted(approved):
@@ -11279,7 +11279,7 @@ class Passivbot:
                 if current is None or current <= 0.0:
                     continue
                 try:
-                    candles = await self.candle_manager.get_candles(
+                    candles = await self.cm.get_candles(
                         symbol,
                         start_ts=today_ms,
                         end_ts=now_ms,
