@@ -406,11 +406,14 @@ def materialize_frames(
                     f"aligned_values_by_coin[{coin!r}] must have shape ({n_steps}, 4), got {aligned.shape}"
                 )
             valid_mask = ~np.isnan(aligned[:, 0])
-            # Exclude stale tail: OhlcvStore pre-allocates future-month chunks
-            # with placeholder data (vol=0, price frozen at last-known).
             vol_series = aligned[:, 3]
             vol_gt_zero = vol_series > 0.0
             if vol_gt_zero.any():
+                # Exclude stale head: pre-listing placeholder data (vol=0)
+                first_real = int(np.flatnonzero(vol_gt_zero)[0])
+                if first_real > 0:
+                    valid_mask[:first_real] = False
+                # Exclude stale tail: future-month placeholder data (vol=0)
                 last_real = int(np.flatnonzero(vol_gt_zero)[-1])
                 if last_real < len(vol_series) - 1:
                     valid_mask[last_real + 1 :] = False
