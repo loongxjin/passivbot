@@ -520,13 +520,20 @@ async def load_markets(
     owned_cc = cc is None
     if owned_cc:
         cc = load_ccxt_instance(ex, enable_rate_limit=True)
+    # Workaround for ccxt bug: some exchanges (e.g. OKX) may return markets
+    # with None IDs, which breaks keysort since None can't be compared with str.
+    _original_keysort = cc.keysort
+    def _safe_keysort(dictionary):
+        filtered = {k: v for k, v in dictionary.items() if k is not None}
+        return _original_keysort(filtered)
+    cc.keysort = _safe_keysort
     try:
         markets = await cc.load_markets(True)
     except Exception as e:
         logging.error(f"Error loading markets from {ex}: {e}")
         raise
     finally:
-        # Only close the ccxt client if we created it here.
+        cc.keysort = _original_keysort
         if owned_cc:
             try:
                 await cc.close()
