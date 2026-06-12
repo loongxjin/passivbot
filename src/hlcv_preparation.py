@@ -1099,8 +1099,19 @@ async def try_prepare_hlcvs_v2_local(
     requested_start_ts = int(date_to_ts(requested_start_date))
     end_date = format_end_date(require_config_value(config, "backtest.end_date"))
     end_ts = int(date_to_ts(end_date))
-    warmup_minutes = compute_backtest_warmup_minutes(config)
     minute_ms = 60_000
+    # Clamp end_ts to now so the store never fetches or pre-allocates
+    # chunks for timestamps that have not occurred yet.
+    now_ms = (int(datetime.now(timezone.utc).timestamp() * 1000) // minute_ms) * minute_ms
+    if end_ts > now_ms:
+        logging.info(
+            "[%s] clamping fetch end_ts from %s to now %s",
+            exchange,
+            ts_to_date(end_ts),
+            ts_to_date(now_ms),
+        )
+        end_ts = now_ms
+    warmup_minutes = compute_backtest_warmup_minutes(config)
     warmup_ms = warmup_minutes * minute_ms
     effective_start_ts = max(0, requested_start_ts - warmup_ms)
     effective_start_ts = (effective_start_ts // minute_ms) * minute_ms
@@ -1617,6 +1628,22 @@ async def _resolve_v2_store_range(
                                 coin,
                                 ts_to_date(int(partial_rng.timestamps[0])),
                                 ts_to_date(int(partial_rng.timestamps[-1])),
+                            )
+                            return partial_rng
+                    # If the stale repair successfully filled historical gaps
+                    # and only trailing / future gaps remain, accept partial
+                    # coverage instead of raising.
+                    if fetch_results and rng is not None and rng.valid.any():
+                        partial_rng = _extract_valid_suffix_window(rng)
+                        if partial_rng is not None and partial_rng.valid.any():
+                            valid_idx = np.flatnonzero(partial_rng.valid)
+                            logging.info(
+                                "[%s] using partial coverage for %s after stale repair "
+                                "(%s -> %s)",
+                                exchange,
+                                coin,
+                                ts_to_date(int(partial_rng.timestamps[int(valid_idx[0])])),
+                                ts_to_date(int(partial_rng.timestamps[int(valid_idx[-1])])),
                             )
                             return partial_rng
                     overlapping_persistent_gaps = remaining_persistent_gaps
@@ -2283,9 +2310,7 @@ async def _collect_first_timestamp_evidence(
 
 def _pre_inception_gaps_are_stale(gaps, first_ts_evidence: dict[str, int]) -> bool:
     authoritative_keys = (
-        "local_first_timestamp",
         "cm_authoritative_start_ts",
-        "unified_exchange_first_timestamp",
     )
     authoritative_ts = [
         int(first_ts_evidence[key])
@@ -2295,8 +2320,9 @@ def _pre_inception_gaps_are_stale(gaps, first_ts_evidence: dict[str, int]) -> bo
     if not authoritative_ts:
         return False
     earliest_authoritative_ts = min(authoritative_ts)
+    one_day_ms = 86_400_000
     return any(
-        earliest_authoritative_ts <= int(gap.end_ts)
+        earliest_authoritative_ts + one_day_ms < int(gap.end_ts)
         and not _pre_inception_gap_confirms_discovered_boundary(gap)
         for gap in gaps
     )

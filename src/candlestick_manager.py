@@ -3419,6 +3419,20 @@ class CandlestickManager:
         try:
             value = meta.get("authoritative_start_ts")
             if value is not None:
+                # Legacy data boundaries can be mistaken for exchange listing
+                # dates (e.g. LINK legacy only goes back to 2024-12-30 but
+                # the exchange actually has data much earlier).  Cross-check
+                # against the unified first-timestamp cache and use the
+                # earliest reliable source.
+                cached = self._lookup_cached_authoritative_start_ts(symbol)
+                if cached is not None and int(cached) < int(value):
+                    self._set_authoritative_start_ts(
+                        symbol,
+                        cached,
+                        source="exchange_specific_cache",
+                        save=True,
+                    )
+                    return int(cached)
                 return int(value)
         except Exception:
             pass
