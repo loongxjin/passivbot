@@ -50,9 +50,10 @@ show_help() {
     echo ""
     echo -e "命令:"
     echo ""
-    echo -e "  ${GREEN}create${NC} <服务名> <配置> <api-key>"
-    echo "      创建新机器人实例（使用 passivbot live CLI）"
+    echo -e "  ${GREEN}create${NC} [服务名] [配置] [api-key]"
+    echo "      创建新机器人实例（参数不足时交互选择）"
     echo "      例: $0 create okx_btc btc_long.json okx_01"
+    echo "      例: $0 create  (逐步提示)"
     echo ""
     echo -e "  ${GREEN}switch${NC} <服务名> <新配置> [新api-key]"
     echo "      切换已有机器人的配置"
@@ -319,26 +320,101 @@ get_config_relative() {
     echo "${config_file#$PASSIVBOT_DIR/}"
 }
 
+pick_config() {
+    # 收集配置文件列表
+    local configs=()
+    while IFS= read -r f; do
+        [ -f "$f" ] || continue
+        configs+=("${f#$PASSIVBOT_DIR/}")
+    done < <(find "$PASSIVBOT_DIR/$CONFIGS_DIR" -maxdepth 2 -name "*.json" -type f 2>/dev/null | grep -v ".example" | sort)
+    if [ ${#configs[@]} -eq 0 ]; then
+        echo ""
+        return 1
+    fi
+    local i=1
+    for c in "${configs[@]}"; do
+        echo "  $i) $c"
+        i=$((i + 1))
+    done
+    echo ""
+    read -p "选择配置 (序号或路径): " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le ${#configs[@]} ]; then
+        echo "${configs[$((choice - 1))]}"
+    elif [ -n "$choice" ]; then
+        echo "$choice"
+    else
+        echo ""
+    fi
+}
+
+pick_api_key() {
+    if [ ! -f "$PASSIVBOT_DIR/$API_KEYS_FILE" ]; then
+        echo ""
+        return 1
+    fi
+    local keys=()
+    while IFS= read -r k; do
+        [ -n "$k" ] && keys+=("$k")
+    done < <(python3 -c "
+import json
+with open('$PASSIVBOT_DIR/$API_KEYS_FILE', 'r') as f:
+    data = json.load(f)
+for k in data:
+    if k != 'referrals' and not k.startswith('_'):
+        print(f\"{k} ({data[k].get('exchange', 'unknown')})\")
+" 2>/dev/null)
+    if [ ${#keys[@]} -eq 0 ]; then
+        echo ""
+        return 1
+    fi
+    local i=1
+    for k in "${keys[@]}"; do
+        echo "  $i) $k"
+        i=$((i + 1))
+    done
+    echo ""
+    read -p "选择 API Key (序号或名称): " choice
+    if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le ${#keys[@]} ]; then
+        echo "${keys[$((choice - 1))]}" | awk '{print $1}'
+    elif [ -n "$choice" ]; then
+        echo "$choice"
+    else
+        echo ""
+    fi
+}
+
 create_bot() {
-    local service_name=$(get_service_name "$1")
+    local service_name="$1"
     local config_input="$2"
     local api_key="$3"
+
+    if [ -n "$service_name" ]; then
+        service_name=$(get_service_name "$service_name")
+    fi
 
     echo "========================================"
     echo "创建新机器人实例 (v7.10.0 CLI)"
     echo "========================================"
     echo ""
 
-    if [ -z "$service_name" ] || [ -z "$config_input" ] || [ -z "$api_key" ]; then
-        echo -e "${RED}错误: 参数不足${NC}"
-        echo "用法: $0 create <服务名> <配置> <api-key>"
-        return 1
+    # 服务名
+    if [ -z "$service_name" ]; then
+        read -p "服务名 (e.g. okx_btc): " service_name
+        [ -z "$service_name" ] && { echo -e "${RED}已取消${NC}"; return 1; }
+        service_name=$(get_service_name "$service_name")
     fi
 
     if [ -f "$SYSTEMD_DIR/$service_name.service" ]; then
         echo -e "${RED}错误: 服务 '$service_name' 已存在${NC}"
-        echo "使用 '$0 list' 查看现有服务"
         return 1
+    fi
+
+    # 交互选择配置
+    if [ -z "$config_input" ]; then
+        echo ""
+        echo "可用配置:"
+        config_input=$(pick_config)
+        [ -z "$config_input" ] && { echo -e "${RED}已取消${NC}"; return 1; }
     fi
 
     local config_file=$(resolve_config_path "$config_input")
@@ -346,14 +422,30 @@ create_bot() {
 
     if [ ! -f "$config_file" ]; then
         echo -e "${RED}错误: 配置文件不存在: $config_file${NC}"
-        list_configs
-        return 1
+        echo "可用配置:"
+        config_input=$(pick_config)
+        [ -z "$config_input" ] && return 1
+        config_file=$(resolve_config_path "$config_input")
+        config_rel=$(get_config_relative "$config_file")
+        [ ! -f "$config_file" ] && { echo -e "${RED}配置文件仍不存在${NC}"; return 1; }
+    fi
+
+    # 交互选择 api-key
+    if [ -z "$api_key" ]; then
+        echo ""
+        echo "可用 API Keys:"
+        api_key=$(pick_api_key)
+        [ -z "$api_key" ] && { echo -e "${RED}已取消${NC}"; return 1; }
     fi
 
     if ! validate_api_key "$api_key"; then
-        return 1
+        echo "可用 API Keys:"
+        api_key=$(pick_api_key)
+        [ -z "$api_key" ] && return 1
+        validate_api_key "$api_key" || return 1
     fi
 
+    echo ""
     echo -e "服务名: ${CYAN}$service_name${NC}"
     echo "配置: $config_rel"
     echo -e "API Key: ${CYAN}$api_key${NC}"
