@@ -321,35 +321,30 @@ get_config_relative() {
 }
 
 pick_config() {
-    # 收集配置文件列表
     local configs=()
     while IFS= read -r f; do
         [ -f "$f" ] || continue
         configs+=("${f#$PASSIVBOT_DIR/}")
     done < <(find "$PASSIVBOT_DIR/$CONFIGS_DIR" -maxdepth 2 -name "*.json" -type f 2>/dev/null | grep -v ".example" | sort)
     if [ ${#configs[@]} -eq 0 ]; then
-        echo ""
         return 1
     fi
     local i=1
     for c in "${configs[@]}"; do
-        echo "  $i) $c"
+        echo "  $i) $c" >&2
         i=$((i + 1))
     done
-    echo ""
+    echo "" >&2
     read -p "选择配置 (序号或路径): " choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le ${#configs[@]} ]; then
         echo "${configs[$((choice - 1))]}"
     elif [ -n "$choice" ]; then
         echo "$choice"
-    else
-        echo ""
     fi
 }
 
 pick_api_key() {
     if [ ! -f "$PASSIVBOT_DIR/$API_KEYS_FILE" ]; then
-        echo ""
         return 1
     fi
     local keys=()
@@ -364,22 +359,19 @@ for k in data:
         print(f\"{k} ({data[k].get('exchange', 'unknown')})\")
 " 2>/dev/null)
     if [ ${#keys[@]} -eq 0 ]; then
-        echo ""
         return 1
     fi
     local i=1
     for k in "${keys[@]}"; do
-        echo "  $i) $k"
+        echo "  $i) $k" >&2
         i=$((i + 1))
     done
-    echo ""
+    echo "" >&2
     read -p "选择 API Key (序号或名称): " choice
     if [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] 2>/dev/null && [ "$choice" -le ${#keys[@]} ]; then
         echo "${keys[$((choice - 1))]}" | awk '{print $1}'
     elif [ -n "$choice" ]; then
         echo "$choice"
-    else
-        echo ""
     fi
 }
 
