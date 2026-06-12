@@ -10,6 +10,7 @@
 #   ./passivbot.sh start|stop|restart <服务名>        # 控制服务
 #   ./passivbot.sh start-all|stop-all                  # 启动/停止所有机器人
 #   ./passivbot.sh delete <服务名>                     # 删除机器人实例
+#   ./passivbot.sh delete-all                           # 删除所有机器人实例
 #   ./passivbot.sh logs <服务名> [行数]                # 查看日志
 #   ./passivbot.sh configs                             # 列出可用配置和API key
 #   ./passivbot.sh check                               # 运行配置兼容性检查
@@ -73,6 +74,9 @@ show_help() {
     echo ""
     echo -e "  ${GREEN}delete${NC} <服务名>"
     echo "      删除机器人实例（保留配置备份）"
+    echo ""
+    echo -e "  ${RED}delete-all${NC}"
+    echo "      删除所有机器人实例"
     echo ""
     echo -e "  ${GREEN}list${NC}"
     echo "      列出所有机器人实例及其状态"
@@ -1059,6 +1063,54 @@ start_all() {
     echo -e "${GREEN}已启动 $count 个机器人${NC}"
 }
 
+delete_all() {
+    echo "========================================"
+    echo -e "${RED}⚠  删除所有机器人实例  ⚠${NC}"
+    echo "========================================"
+    echo ""
+
+    # 列出所有实例
+    local svc_list=()
+    for service_file in "$SYSTEMD_DIR"/passivbot*.service; do
+        [ -f "$service_file" ] || continue
+        svc_list+=("$(basename "$service_file" .service)")
+    done
+
+    if [ ${#svc_list[@]} -eq 0 ]; then
+        echo -e "${YELLOW}没有可删除的机器人${NC}"
+        return 0
+    fi
+
+    echo "将要删除以下所有实例:"
+    for svc in "${svc_list[@]}"; do
+        echo -e "  ${CYAN}$svc${NC}"
+    done
+    echo ""
+    echo -e "${RED}此操作不可逆！${NC}"
+
+    read -p "确认删除? 输入 YES 确认: " confirm
+    if [ "$confirm" != "YES" ]; then
+        echo "已取消"
+        return 0
+    fi
+
+    local count=0
+    for svc in "${svc_list[@]}"; do
+        echo ""
+        echo -e "删除 ${CYAN}$svc${NC}..."
+        systemctl is-active --quiet "$svc" 2>/dev/null && sudo systemctl stop "$svc"
+        sudo systemctl disable "$svc" 2>/dev/null || true
+        sudo mv "$SYSTEMD_DIR/$svc.service" "$SYSTEMD_DIR/$svc.service.deleted.$(date +%Y%m%d_%H%M%S)"
+        count=$((count + 1))
+    done
+
+    sudo systemctl daemon-reload
+
+    echo ""
+    echo -e "${GREEN}已删除 $count 个机器人实例${NC}"
+    echo "配置文件和日志文件仍保留在服务器上"
+}
+
 clean_logs() {
     local days="${1:-7}"
     local log_dir="$PASSIVBOT_DIR/logs"
@@ -1157,6 +1209,9 @@ main() {
         delete|remove|rm|d)
             shift
             delete_bot "$1"
+            ;;
+        delete-all|da)
+            delete_all
             ;;
         list|ls|l)
             list_bots
