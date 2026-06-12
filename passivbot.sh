@@ -8,10 +8,12 @@
 #   ./passivbot.sh list                               # 列出所有机器人
 #   ./passivbot.sh status [服务名]                    # 查看状态
 #   ./passivbot.sh start|stop|restart <服务名>        # 控制服务
-#   ./passivbot.sh delete <服务名>                    # 删除机器人实例
-#   ./passivbot.sh logs <服务名> [行数]               # 查看日志
-#   ./passivbot.sh configs                            # 列出可用配置和API key
-#   ./passivbot.sh check                              # 运行配置兼容性检查
+#   ./passivbot.sh start-all|stop-all                  # 启动/停止所有机器人
+#   ./passivbot.sh delete <服务名>                     # 删除机器人实例
+#   ./passivbot.sh logs <服务名> [行数]                # 查看日志
+#   ./passivbot.sh configs                             # 列出可用配置和API key
+#   ./passivbot.sh check                               # 运行配置兼容性检查
+#   ./passivbot.sh clean-logs [保留天数]               # 清理历史日志
 
 set -e
 
@@ -107,6 +109,9 @@ show_help() {
   echo -e "  ${GREEN}help${NC}"
   echo "      显示此帮助"
   echo ""
+  echo -e "  ${GREEN}clean-logs${NC} [保留天数]"
+  echo "      删除 N 天前的历史日志（默认 7 天）"
+  echo ""
 }
 
 validate_service_name() {
@@ -161,6 +166,24 @@ except Exception:
     echo ""
 }
 
+find_log_file() {
+    local user="$1"
+    local log_dir="$PASSIVBOT_DIR/logs"
+    # 优先匹配 {user}.log
+    if [ -f "$log_dir/$user.log" ]; then
+        echo "$log_dir/$user.log"
+        return 0
+    fi
+    # 匹配带时间戳的日志
+    local latest=$(ls -t "$log_dir"/*_passivbot_live_*_-u_"${user}"_*.log 2>/dev/null | head -1)
+    if [ -n "$latest" ]; then
+        echo "$latest"
+        return 0
+    fi
+    echo ""
+    return 1
+}
+
 list_bots() {
     echo "========================================"
     echo "Passivbot 机器人实例列表 (v7.10.0+)"
@@ -191,6 +214,12 @@ list_bots() {
                 echo -e "  状态: $status (PID: $pid, 启动: $uptime)"
             else
                 echo -e "  状态: $status"
+            fi
+            # 统计该用户的日志文件数量
+            local log_total=$(find "$PASSIVBOT_DIR/logs" -maxdepth 1 -type f \( -name "*_-u_${api_key}_*.log" -o -name "${api_key}.log" \) 2>/dev/null | wc -l | xargs)
+            local log_current=$(find_log_file "$api_key")
+            if [ -n "$log_current" ]; then
+                echo -e "  日志: ${log_current#$PASSIVBOT_DIR/logs/} (共 ${log_total} 个文件)"
             fi
             echo ""
         fi
@@ -535,11 +564,11 @@ show_status() {
 
     echo ""
     echo "最近日志 (passivbot主日志, 10行):"
-    local log_file="$PASSIVBOT_DIR/logs/${api_key}.log"
-    if [ -n "$api_key" ] && [ -f "$log_file" ]; then
+    local log_file=$(find_log_file "$api_key")
+    if [ -n "$api_key" ] && [ -n "$log_file" ]; then
         tail -n 10 "$log_file" 2>/dev/null || echo "无法读取日志文件"
     else
-        echo "未找到 passivbot 主日志 (logs/${api_key}.log)"
+        echo "未找到 passivbot 主日志 (user=$api_key)"
         echo "尝试 systemd 日志..."
         journalctl -u "$service_name" -n 10 --no-pager 2>/dev/null || echo "无日志"
     fi
@@ -561,15 +590,16 @@ show_logs() {
 
     local api_key=$(get_api_key_from_service "$service_name")
 
+    local log_file=$(find_log_file "$api_key")
+
     echo "========================================"
     echo "Passivbot 主日志 (user=$api_key, 最后$lines行)"
     echo "========================================"
 
-    local log_file="$PASSIVBOT_DIR/logs/${api_key}.log"
-    if [ -n "$api_key" ] && [ -f "$log_file" ]; then
+    if [ -n "$api_key" ] && [ -n "$log_file" ]; then
         tail -n "$lines" "$log_file"
     else
-        echo -e "${YELLOW}未找到 passivbot 主日志${NC}"
+        echo -e "${YELLOW}未找到 passivbot 主日志 (user=$api_key)${NC}"
         echo "尝试 systemd 日志..."
         journalctl -u "$service_name" -n "$lines" --no-pager
     fi
@@ -1029,6 +1059,71 @@ start_all() {
     echo -e "${GREEN}已启动 $count 个机器人${NC}"
 }
 
+clean_logs() {
+    local days="${1:-7}"
+    local log_dir="$PASSIVBOT_DIR/logs"
+
+    echo "========================================"
+    echo "清理日志"
+    echo "========================================"
+    echo ""
+
+    if [ ! -d "$log_dir" ]; then
+        echo -e "${YELLOW}日志目录不存在${NC}"
+        return 0
+    fi
+
+    local total_before=$(find "$log_dir" -maxdepth 1 -type f -name "*.log" 2>/dev/null | wc -l | xargs)
+    echo "当前日志文件总数: $total_before"
+    echo ""
+
+    # 收集所有活跃 user（从已有 systemd 服务提取）
+    declare -A active_users
+    for service_file in "$SYSTEMD_DIR"/passivbot*.service; do
+        [ -f "$service_file" ] || continue
+        local svc=$(basename "$service_file" .service)
+        local u=$(get_api_key_from_service "$svc")
+        [ -n "$u" ] && active_users["$u"]=1
+    done
+
+    local deleted=0
+
+    # 对每个活跃用户，保留最新的 ONE 个带时间戳的日志，删除其余旧的
+    for user in "${!active_users[@]}"; do
+        local ts_files=$(ls -t "$log_dir"/*_passivbot_live_*_-u_"${user}"_*.log 2>/dev/null)
+        local count=0
+        while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            count=$((count + 1))
+            if [ $count -eq 1 ]; then
+                continue  # 保留最新一个
+            fi
+            echo -e "  删除: ${YELLOW}$(basename "$f")${NC}"
+            rm -f "$f"
+            deleted=$((deleted + 1))
+        done <<< "$ts_files"
+    done
+
+    # 删除已被删除的服务对应的孤立日志（无对应 systemd 服务的 user 的日志）
+    while IFS= read -r f; do
+        [ -z "$f" ] && continue
+        local name=$(basename "$f")
+        # 跳过 systemd 日志和非时间戳日志
+        [[ "$name" == *.systemd.log ]] && continue
+        [[ "$name" =~ ^[0-9]{8}_ ]] || continue
+        local file_user=$(echo "$name" | grep -oP -- '-u_\K[^_]+(?=_)' 2>/dev/null || echo "")
+        if [ -n "$file_user" ] && [ -z "${active_users[$file_user]}" ]; then
+            echo -e "  删除孤立日志: ${YELLOW}$name${NC}"
+            rm -f "$f"
+            deleted=$((deleted + 1))
+        fi
+    done < <(find "$log_dir" -maxdepth 1 -type f -name "*.log" -mtime +$days 2>/dev/null)
+
+    local total_after=$(find "$log_dir" -maxdepth 1 -type f -name "*.log" 2>/dev/null | wc -l | xargs)
+    echo ""
+    echo -e "${GREEN}清理完成: $total_before -> $total_after (删除 $deleted 个)${NC}"
+}
+
 main() {
     local cmd="${1:-help}"
 
@@ -1094,6 +1189,10 @@ main() {
             ;;
         unpanic-all|upa)
             unpanic_all
+            ;;
+        clean-logs)
+            shift
+            clean_logs "$@"
             ;;
         help|--help|-h)
             show_help
