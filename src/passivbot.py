@@ -10316,160 +10316,170 @@ class Passivbot:
                 self, symbols
             )
 
-        global_bp = {
-            "long": self._bot_params_to_rust_dict("long", None),
-            "short": self._bot_params_to_rust_dict("short", None),
-        }
-        # Effective hedge_mode = config setting AND exchange capability.
-        # If either is False, we block same-coin hedging in the orchestrator.
-        effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
-        input_dict = {
-            "balance": self.get_hysteresis_snapped_balance(),
-            "balance_raw": self.get_raw_balance(),
-            "global": {
-                "filter_by_min_effective_cost": bool(
-                    self.live_value("filter_by_min_effective_cost")
-                ),
-                "market_orders_allowed": bool(self.live_value("market_orders_allowed")),
-                "market_order_near_touch_threshold": float(
-                    self.live_value("market_order_near_touch_threshold")
-                ),
-                "panic_close_market": bool(
-                    any(
-                        Passivbot._equity_hard_stop_panic_close_order_type(self, pside)
-                        == "market"
-                        for pside in ("long", "short")
-                        if Passivbot._equity_hard_stop_enabled(self, pside)
-                    )
-                ),
-                "unstuck_allowance_long": float(unstuck_allowances.get("long", 0.0)),
-                "unstuck_allowance_short": float(unstuck_allowances.get("short", 0.0)),
-                "max_realized_loss_pct": max_realized_loss_pct,
-                "realized_pnl_cumsum_max": float(
-                    realized_pnl_cumsum.get("max", 0.0) or 0.0
-                ),
-                "realized_pnl_cumsum_last": float(
-                    realized_pnl_cumsum.get("last", 0.0) or 0.0
-                ),
-                "sort_global": True,
-                "global_bot_params": global_bp,
-                "hedge_mode": effective_hedge_mode,
-            },
-            "symbols": [],
-        }
-
-        symbol_to_idx: dict[str, int] = {s: i for i, s in enumerate(symbols)}
-        idx_to_symbol: dict[int, str] = {i: s for s, i in symbol_to_idx.items()}
-        input_dict.update(
-            Passivbot._build_orchestrator_runtime_hints(self, symbol_to_idx)
-        )
-
-        for symbol in symbols:
-            idx = symbol_to_idx[symbol]
-            mprice = float(last_prices.get(symbol, 0.0))
-            if not math.isfinite(mprice) or mprice <= 0.0:
-                raise Exception(f"invalid market price for {symbol}: {mprice}")
-
-            active = bool(self.markets_dict.get(symbol, {}).get("active", True))
-            effective_min_cost = float(
-                getattr(self, "effective_min_cost", {}).get(symbol, 0.0) or 0.0
-            )
-            if effective_min_cost <= 0.0:
-                effective_min_cost = self._calc_effective_min_cost_at_price(
-                    symbol, mprice
-                )
-
-            def side_input(pside: str) -> dict:
-                mode = Passivbot._mode_override_to_orchestrator_mode(
-                    self, mode_overrides[pside].get(symbol)
-                )
-                pos = self.positions.get(symbol, {}).get(
-                    pside, {"size": 0.0, "price": 0.0}
-                )
-                trailing = self.trailing_prices.get(symbol, {}).get(pside)
-                if not trailing:
-                    trailing = _trailing_bundle_default_dict()
-                else:
-                    trailing = dict(trailing)
-                return {
-                    "mode": mode,
-                    "position": {
-                        "size": float(pos["size"]),
-                        "price": float(pos["price"]),
-                    },
-                    "trailing": {
-                        "min_since_open": float(trailing.get("min_since_open", 0.0)),
-                        "max_since_min": float(trailing.get("max_since_min", 0.0)),
-                        "max_since_open": float(trailing.get("max_since_open", 0.0)),
-                        "min_since_max": float(trailing.get("min_since_max", 0.0)),
-                    },
-                    "bot_params": self._bot_params_to_rust_dict(pside, symbol),
-                }
-
-            m1_close_pairs = [
-                [float(k), float(v)] for k, v in sorted(m1_close_emas[symbol].items())
-            ]
-            m1_volume_pairs = [
-                [float(k), float(v)] for k, v in sorted(m1_volume_emas[symbol].items())
-            ]
-            m1_lr_pairs = [
-                [float(k), float(v)]
-                for k, v in sorted(m1_log_range_emas[symbol].items())
-            ]
-            h1_lr_pairs = [
-                [float(k), float(v)]
-                for k, v in sorted(h1_log_range_emas[symbol].items())
-            ]
-
-            input_dict["symbols"].append(
-                {
-                    "symbol_idx": int(idx),
-                    "order_book": {"bid": mprice, "ask": mprice},
-                    "exchange": {
-                        "qty_step": float(self.qty_steps[symbol]),
-                        "price_step": float(self.price_steps[symbol]),
-                        "min_qty": float(self.min_qtys[symbol]),
-                        "min_cost": float(self.min_costs[symbol]),
-                        "c_mult": float(self.c_mults[symbol]),
-                        "maker_fee": float(
-                            self.markets_dict.get(symbol, {}).get("maker", 0.0) or 0.0
-                        ),
-                        "taker_fee": float(
-                            self.markets_dict.get(symbol, {}).get("taker", 0.0) or 0.0
-                        ),
-                    },
-                    "tradable": bool(active),
-                    "next_candle": None,
-                    "effective_min_cost": float(effective_min_cost),
-                    "emas": {
-                        "m1": {
-                            "close": m1_close_pairs,
-                            "log_range": m1_lr_pairs,
-                            "volume": m1_volume_pairs,
-                        },
-                        "h1": {"close": [], "log_range": h1_lr_pairs, "volume": []},
-                    },
-                    "long": side_input("long"),
-                    "short": side_input("short"),
-                }
-            )
-
+        effective_twe_long = await self._apply_day_drop_twe_shrink(last_prices)
+        twe_was_shrunk = effective_twe_long != self._original_twe_long
+        if twe_was_shrunk:
+            self.config["bot"]["long"]["total_wallet_exposure_limit"] = effective_twe_long
+            self.set_wallet_exposure_limits()
         try:
-            out_json = pbr.compute_ideal_orders_json(json.dumps(input_dict))
-        except Exception as e:
-            msg = str(e)
-            if "MissingEma" in msg:
-                match = re.search(r"symbol_idx\s*:\s*(\d+)", msg)
-                if match:
-                    idx = int(match.group(1))
-                    symbol = idx_to_symbol.get(idx)
-                    if symbol:
-                        logging.error(
-                            "[ema] Missing EMA for %s (symbol_idx=%d)",
-                            Passivbot._log_symbol(symbol),
-                            idx,
+            global_bp = {
+                "long": self._bot_params_to_rust_dict("long", None),
+                "short": self._bot_params_to_rust_dict("short", None),
+            }
+            # Effective hedge_mode = config setting AND exchange capability.
+            # If either is False, we block same-coin hedging in the orchestrator.
+            effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
+            input_dict = {
+                "balance": self.get_hysteresis_snapped_balance(),
+                "balance_raw": self.get_raw_balance(),
+                "global": {
+                    "filter_by_min_effective_cost": bool(
+                        self.live_value("filter_by_min_effective_cost")
+                    ),
+                    "market_orders_allowed": bool(self.live_value("market_orders_allowed")),
+                    "market_order_near_touch_threshold": float(
+                        self.live_value("market_order_near_touch_threshold")
+                    ),
+                    "panic_close_market": bool(
+                        any(
+                            Passivbot._equity_hard_stop_panic_close_order_type(self, pside)
+                            == "market"
+                            for pside in ("long", "short")
+                            if Passivbot._equity_hard_stop_enabled(self, pside)
                         )
-            raise
+                    ),
+                    "unstuck_allowance_long": float(unstuck_allowances.get("long", 0.0)),
+                    "unstuck_allowance_short": float(unstuck_allowances.get("short", 0.0)),
+                    "max_realized_loss_pct": max_realized_loss_pct,
+                    "realized_pnl_cumsum_max": float(
+                        realized_pnl_cumsum.get("max", 0.0) or 0.0
+                    ),
+                    "realized_pnl_cumsum_last": float(
+                        realized_pnl_cumsum.get("last", 0.0) or 0.0
+                    ),
+                    "sort_global": True,
+                    "global_bot_params": global_bp,
+                    "hedge_mode": effective_hedge_mode,
+                },
+                "symbols": [],
+            }
+    
+            symbol_to_idx: dict[str, int] = {s: i for i, s in enumerate(symbols)}
+            idx_to_symbol: dict[int, str] = {i: s for s, i in symbol_to_idx.items()}
+            input_dict.update(
+                Passivbot._build_orchestrator_runtime_hints(self, symbol_to_idx)
+            )
+    
+            for symbol in symbols:
+                idx = symbol_to_idx[symbol]
+                mprice = float(last_prices.get(symbol, 0.0))
+                if not math.isfinite(mprice) or mprice <= 0.0:
+                    raise Exception(f"invalid market price for {symbol}: {mprice}")
+    
+                active = bool(self.markets_dict.get(symbol, {}).get("active", True))
+                effective_min_cost = float(
+                    getattr(self, "effective_min_cost", {}).get(symbol, 0.0) or 0.0
+                )
+                if effective_min_cost <= 0.0:
+                    effective_min_cost = self._calc_effective_min_cost_at_price(
+                        symbol, mprice
+                    )
+    
+                def side_input(pside: str) -> dict:
+                    mode = Passivbot._mode_override_to_orchestrator_mode(
+                        self, mode_overrides[pside].get(symbol)
+                    )
+                    pos = self.positions.get(symbol, {}).get(
+                        pside, {"size": 0.0, "price": 0.0}
+                    )
+                    trailing = self.trailing_prices.get(symbol, {}).get(pside)
+                    if not trailing:
+                        trailing = _trailing_bundle_default_dict()
+                    else:
+                        trailing = dict(trailing)
+                    return {
+                        "mode": mode,
+                        "position": {
+                            "size": float(pos["size"]),
+                            "price": float(pos["price"]),
+                        },
+                        "trailing": {
+                            "min_since_open": float(trailing.get("min_since_open", 0.0)),
+                            "max_since_min": float(trailing.get("max_since_min", 0.0)),
+                            "max_since_open": float(trailing.get("max_since_open", 0.0)),
+                            "min_since_max": float(trailing.get("min_since_max", 0.0)),
+                        },
+                        "bot_params": self._bot_params_to_rust_dict(pside, symbol),
+                    }
+    
+                m1_close_pairs = [
+                    [float(k), float(v)] for k, v in sorted(m1_close_emas[symbol].items())
+                ]
+                m1_volume_pairs = [
+                    [float(k), float(v)] for k, v in sorted(m1_volume_emas[symbol].items())
+                ]
+                m1_lr_pairs = [
+                    [float(k), float(v)]
+                    for k, v in sorted(m1_log_range_emas[symbol].items())
+                ]
+                h1_lr_pairs = [
+                    [float(k), float(v)]
+                    for k, v in sorted(h1_log_range_emas[symbol].items())
+                ]
+    
+                input_dict["symbols"].append(
+                    {
+                        "symbol_idx": int(idx),
+                        "order_book": {"bid": mprice, "ask": mprice},
+                        "exchange": {
+                            "qty_step": float(self.qty_steps[symbol]),
+                            "price_step": float(self.price_steps[symbol]),
+                            "min_qty": float(self.min_qtys[symbol]),
+                            "min_cost": float(self.min_costs[symbol]),
+                            "c_mult": float(self.c_mults[symbol]),
+                            "maker_fee": float(
+                                self.markets_dict.get(symbol, {}).get("maker", 0.0) or 0.0
+                            ),
+                            "taker_fee": float(
+                                self.markets_dict.get(symbol, {}).get("taker", 0.0) or 0.0
+                            ),
+                        },
+                        "tradable": bool(active),
+                        "next_candle": None,
+                        "effective_min_cost": float(effective_min_cost),
+                        "emas": {
+                            "m1": {
+                                "close": m1_close_pairs,
+                                "log_range": m1_lr_pairs,
+                                "volume": m1_volume_pairs,
+                            },
+                            "h1": {"close": [], "log_range": h1_lr_pairs, "volume": []},
+                        },
+                        "long": side_input("long"),
+                        "short": side_input("short"),
+                    }
+                )
+    
+            try:
+                out_json = pbr.compute_ideal_orders_json(json.dumps(input_dict))
+            except Exception as e:
+                msg = str(e)
+                if "MissingEma" in msg:
+                    match = re.search(r"symbol_idx\s*:\s*(\d+)", msg)
+                    if match:
+                        idx = int(match.group(1))
+                        symbol = idx_to_symbol.get(idx)
+                        if symbol:
+                            logging.error(
+                                "[ema] Missing EMA for %s (symbol_idx=%d)",
+                                Passivbot._log_symbol(symbol),
+                                idx,
+                            )
+                raise
+        finally:
+            if twe_was_shrunk:
+                self.config["bot"]["long"]["total_wallet_exposure_limit"] = self._original_twe_long
+                self.set_wallet_exposure_limits()
         out = json.loads(out_json)
         self._log_realized_loss_gate_blocks(out, idx_to_symbol)
         if hasattr(self, "_log_min_effective_cost_blocks"):
@@ -11250,14 +11260,20 @@ class Passivbot:
             self._day_drop_twe_trigger_day = 0
 
         if self._day_drop_twe_trigger_day == 0:
-            # Scan ALL approved coins — a coin you're not trading can still
-            # signal market-wide stress.
+            # Scan ALL approved coins using CandlestickManager prices.
+            # A coin outside active_symbols can still be selected next —
+            # we need to know if it's already crashing.
             approved = set()
             for pside in ("long", "short"):
                 coins = getattr(self, "approved_coins_minus_ignored_coins", {}).get(pside, set())
                 approved.update(coins)
+            if not approved:
+                return twe
+            all_prices = await self.candle_manager.get_last_prices(
+                list(approved), max_age_ms=60_000
+            )
             for symbol in sorted(approved):
-                current = last_prices.get(symbol)
+                current = all_prices.get(symbol)
                 if current is None or current <= 0.0:
                     continue
                 try:
@@ -11352,165 +11368,172 @@ class Passivbot:
         max_realized_loss_pct = float(self.live_value("max_realized_loss_pct") or 1.0)
 
         effective_twe_long = await self._apply_day_drop_twe_shrink(last_prices)
-        global_bp = {
-            "long": self._bot_params_to_rust_dict("long", None),
-            "short": self._bot_params_to_rust_dict("short", None),
-        }
-        if effective_twe_long != self._original_twe_long:
-            global_bp["long"]["total_wallet_exposure_limit"] = effective_twe_long
-        # Effective hedge_mode = config setting AND exchange capability.
-        # If either is False, we block same-coin hedging in the orchestrator.
-        effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
-        input_dict = {
-            "balance": self.get_hysteresis_snapped_balance(),
-            "balance_raw": self.get_raw_balance(),
-            "global": {
-                "filter_by_min_effective_cost": bool(
-                    self.live_value("filter_by_min_effective_cost")
-                ),
-                "market_orders_allowed": bool(self.live_value("market_orders_allowed")),
-                "market_order_near_touch_threshold": float(
-                    self.live_value("market_order_near_touch_threshold")
-                ),
-                "panic_close_market": bool(
-                    any(
-                        Passivbot._equity_hard_stop_panic_close_order_type(self, pside)
-                        == "market"
-                        for pside in ("long", "short")
-                        if Passivbot._equity_hard_stop_enabled(self, pside)
-                    )
-                ),
-                "unstuck_allowance_long": float(unstuck_allowances.get("long", 0.0)),
-                "unstuck_allowance_short": float(unstuck_allowances.get("short", 0.0)),
-                "max_realized_loss_pct": max_realized_loss_pct,
-                "realized_pnl_cumsum_max": float(
-                    realized_pnl_cumsum.get("max", 0.0) or 0.0
-                ),
-                "realized_pnl_cumsum_last": float(
-                    realized_pnl_cumsum.get("last", 0.0) or 0.0
-                ),
-                "sort_global": True,
-                "global_bot_params": global_bp,
-                "hedge_mode": effective_hedge_mode,
-            },
-            "symbols": [],
-        }
-
-        symbol_to_idx: dict[str, int] = {s: i for i, s in enumerate(symbols)}
-        idx_to_symbol: dict[int, str] = {i: s for s, i in symbol_to_idx.items()}
-        input_dict.update(
-            Passivbot._build_orchestrator_runtime_hints(self, symbol_to_idx)
-        )
-
-        for symbol in symbols:
-            idx = symbol_to_idx[symbol]
-            snap = market_snapshots.get(symbol)
-            mprice = float(last_prices.get(symbol, 0.0))
-            if not math.isfinite(mprice) or mprice <= 0.0:
-                raise Exception(f"invalid market price for {symbol}: {mprice}")
-            bid = float(snap.bid) if snap is not None and snap.is_valid() else mprice
-            ask = float(snap.ask) if snap is not None and snap.is_valid() else mprice
-
-            active = bool(self.markets_dict.get(symbol, {}).get("active", True))
-            tradable = bool(active and symbol not in ema_unavailable_symbols)
-            effective_min_cost = float(self.effective_min_cost.get(symbol, 0.0) or 0.0)
-            if effective_min_cost <= 0.0:
-                effective_min_cost = self._calc_effective_min_cost_at_price(
-                    symbol, mprice
-                )
-
-            def side_input(pside: str) -> dict:
-                mode = self._mode_override_to_orchestrator_mode(
-                    mode_overrides[pside].get(symbol)
-                )
-                pos = self.positions.get(symbol, {}).get(
-                    pside, {"size": 0.0, "price": 0.0}
-                )
-                trailing = self.trailing_prices.get(symbol, {}).get(pside)
-                if not trailing:
-                    trailing = _trailing_bundle_default_dict()
-                else:
-                    trailing = dict(trailing)
-                return {
-                    "mode": mode,
-                    "position": {
-                        "size": float(pos["size"]),
-                        "price": float(pos["price"]),
-                    },
-                    "trailing": {
-                        "min_since_open": float(trailing.get("min_since_open", 0.0)),
-                        "max_since_min": float(trailing.get("max_since_min", 0.0)),
-                        "max_since_open": float(trailing.get("max_since_open", 0.0)),
-                        "min_since_max": float(trailing.get("min_since_max", 0.0)),
-                    },
-                    "bot_params": self._bot_params_to_rust_dict(pside, symbol),
-                }
-
-            # Build EMA bundle for this symbol.
-            m1_close_pairs = [
-                [float(k), float(v)] for k, v in sorted(m1_close_emas[symbol].items())
-            ]
-            m1_volume_pairs = [
-                [float(k), float(v)] for k, v in sorted(m1_volume_emas[symbol].items())
-            ]
-            m1_lr_pairs = [
-                [float(k), float(v)]
-                for k, v in sorted(m1_log_range_emas[symbol].items())
-            ]
-            h1_lr_pairs = [
-                [float(k), float(v)]
-                for k, v in sorted(h1_log_range_emas[symbol].items())
-            ]
-
-            input_dict["symbols"].append(
-                {
-                    "symbol_idx": int(idx),
-                    "order_book": {"bid": bid, "ask": ask},
-                    "exchange": {
-                        "qty_step": float(self.qty_steps[symbol]),
-                        "price_step": float(self.price_steps[symbol]),
-                        "min_qty": float(self.min_qtys[symbol]),
-                        "min_cost": float(self.min_costs[symbol]),
-                        "c_mult": float(self.c_mults[symbol]),
-                        "maker_fee": float(
-                            self.markets_dict.get(symbol, {}).get("maker", 0.0) or 0.0
-                        ),
-                        "taker_fee": float(
-                            self.markets_dict.get(symbol, {}).get("taker", 0.0) or 0.0
-                        ),
-                    },
-                    "tradable": tradable,
-                    "next_candle": None,
-                    "effective_min_cost": float(effective_min_cost),
-                    "emas": {
-                        "m1": {
-                            "close": m1_close_pairs,
-                            "log_range": m1_lr_pairs,
-                            "volume": m1_volume_pairs,
-                        },
-                        "h1": {"close": [], "log_range": h1_lr_pairs, "volume": []},
-                    },
-                    "long": side_input("long"),
-                    "short": side_input("short"),
-                }
-            )
-
+        twe_was_shrunk = effective_twe_long != self._original_twe_long
+        if twe_was_shrunk:
+            self.config["bot"]["long"]["total_wallet_exposure_limit"] = effective_twe_long
+            self.set_wallet_exposure_limits()
         try:
-            out_json = pbr.compute_ideal_orders_json(json.dumps(input_dict))
-        except Exception as e:
-            msg = str(e)
-            if "MissingEma" in msg:
-                match = re.search(r"symbol_idx\s*:\s*(\d+)", msg)
-                if match:
-                    idx = int(match.group(1))
-                    symbol = idx_to_symbol.get(idx)
-                    if symbol:
-                        logging.error(
-                            "[ema] Missing EMA for %s (symbol_idx=%d)",
-                            Passivbot._log_symbol(symbol),
-                            idx,
+            global_bp = {
+                "long": self._bot_params_to_rust_dict("long", None),
+                "short": self._bot_params_to_rust_dict("short", None),
+            }
+            # Effective hedge_mode = config setting AND exchange capability.
+            # If either is False, we block same-coin hedging in the orchestrator.
+            effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
+            input_dict = {
+                "balance": self.get_hysteresis_snapped_balance(),
+                "balance_raw": self.get_raw_balance(),
+                "global": {
+                    "filter_by_min_effective_cost": bool(
+                        self.live_value("filter_by_min_effective_cost")
+                    ),
+                    "market_orders_allowed": bool(self.live_value("market_orders_allowed")),
+                    "market_order_near_touch_threshold": float(
+                        self.live_value("market_order_near_touch_threshold")
+                    ),
+                    "panic_close_market": bool(
+                        any(
+                            Passivbot._equity_hard_stop_panic_close_order_type(self, pside)
+                            == "market"
+                            for pside in ("long", "short")
+                            if Passivbot._equity_hard_stop_enabled(self, pside)
                         )
-            raise
+                    ),
+                    "unstuck_allowance_long": float(unstuck_allowances.get("long", 0.0)),
+                    "unstuck_allowance_short": float(unstuck_allowances.get("short", 0.0)),
+                    "max_realized_loss_pct": max_realized_loss_pct,
+                    "realized_pnl_cumsum_max": float(
+                        realized_pnl_cumsum.get("max", 0.0) or 0.0
+                    ),
+                    "realized_pnl_cumsum_last": float(
+                        realized_pnl_cumsum.get("last", 0.0) or 0.0
+                    ),
+                    "sort_global": True,
+                    "global_bot_params": global_bp,
+                    "hedge_mode": effective_hedge_mode,
+                },
+                "symbols": [],
+            }
+    
+            symbol_to_idx: dict[str, int] = {s: i for i, s in enumerate(symbols)}
+            idx_to_symbol: dict[int, str] = {i: s for s, i in symbol_to_idx.items()}
+            input_dict.update(
+                Passivbot._build_orchestrator_runtime_hints(self, symbol_to_idx)
+            )
+    
+            for symbol in symbols:
+                idx = symbol_to_idx[symbol]
+                snap = market_snapshots.get(symbol)
+                mprice = float(last_prices.get(symbol, 0.0))
+                if not math.isfinite(mprice) or mprice <= 0.0:
+                    raise Exception(f"invalid market price for {symbol}: {mprice}")
+                bid = float(snap.bid) if snap is not None and snap.is_valid() else mprice
+                ask = float(snap.ask) if snap is not None and snap.is_valid() else mprice
+    
+                active = bool(self.markets_dict.get(symbol, {}).get("active", True))
+                tradable = bool(active and symbol not in ema_unavailable_symbols)
+                effective_min_cost = float(self.effective_min_cost.get(symbol, 0.0) or 0.0)
+                if effective_min_cost <= 0.0:
+                    effective_min_cost = self._calc_effective_min_cost_at_price(
+                        symbol, mprice
+                    )
+    
+                def side_input(pside: str) -> dict:
+                    mode = self._mode_override_to_orchestrator_mode(
+                        mode_overrides[pside].get(symbol)
+                    )
+                    pos = self.positions.get(symbol, {}).get(
+                        pside, {"size": 0.0, "price": 0.0}
+                    )
+                    trailing = self.trailing_prices.get(symbol, {}).get(pside)
+                    if not trailing:
+                        trailing = _trailing_bundle_default_dict()
+                    else:
+                        trailing = dict(trailing)
+                    return {
+                        "mode": mode,
+                        "position": {
+                            "size": float(pos["size"]),
+                            "price": float(pos["price"]),
+                        },
+                        "trailing": {
+                            "min_since_open": float(trailing.get("min_since_open", 0.0)),
+                            "max_since_min": float(trailing.get("max_since_min", 0.0)),
+                            "max_since_open": float(trailing.get("max_since_open", 0.0)),
+                            "min_since_max": float(trailing.get("min_since_max", 0.0)),
+                        },
+                        "bot_params": self._bot_params_to_rust_dict(pside, symbol),
+                    }
+    
+                # Build EMA bundle for this symbol.
+                m1_close_pairs = [
+                    [float(k), float(v)] for k, v in sorted(m1_close_emas[symbol].items())
+                ]
+                m1_volume_pairs = [
+                    [float(k), float(v)] for k, v in sorted(m1_volume_emas[symbol].items())
+                ]
+                m1_lr_pairs = [
+                    [float(k), float(v)]
+                    for k, v in sorted(m1_log_range_emas[symbol].items())
+                ]
+                h1_lr_pairs = [
+                    [float(k), float(v)]
+                    for k, v in sorted(h1_log_range_emas[symbol].items())
+                ]
+    
+                input_dict["symbols"].append(
+                    {
+                        "symbol_idx": int(idx),
+                        "order_book": {"bid": bid, "ask": ask},
+                        "exchange": {
+                            "qty_step": float(self.qty_steps[symbol]),
+                            "price_step": float(self.price_steps[symbol]),
+                            "min_qty": float(self.min_qtys[symbol]),
+                            "min_cost": float(self.min_costs[symbol]),
+                            "c_mult": float(self.c_mults[symbol]),
+                            "maker_fee": float(
+                                self.markets_dict.get(symbol, {}).get("maker", 0.0) or 0.0
+                            ),
+                            "taker_fee": float(
+                                self.markets_dict.get(symbol, {}).get("taker", 0.0) or 0.0
+                            ),
+                        },
+                        "tradable": tradable,
+                        "next_candle": None,
+                        "effective_min_cost": float(effective_min_cost),
+                        "emas": {
+                            "m1": {
+                                "close": m1_close_pairs,
+                                "log_range": m1_lr_pairs,
+                                "volume": m1_volume_pairs,
+                            },
+                            "h1": {"close": [], "log_range": h1_lr_pairs, "volume": []},
+                        },
+                        "long": side_input("long"),
+                        "short": side_input("short"),
+                    }
+                )
+    
+            try:
+                out_json = pbr.compute_ideal_orders_json(json.dumps(input_dict))
+            except Exception as e:
+                msg = str(e)
+                if "MissingEma" in msg:
+                    match = re.search(r"symbol_idx\s*:\s*(\d+)", msg)
+                    if match:
+                        idx = int(match.group(1))
+                        symbol = idx_to_symbol.get(idx)
+                        if symbol:
+                            logging.error(
+                                "[ema] Missing EMA for %s (symbol_idx=%d)",
+                                Passivbot._log_symbol(symbol),
+                                idx,
+                            )
+                raise
+        finally:
+            if twe_was_shrunk:
+                self.config["bot"]["long"]["total_wallet_exposure_limit"] = self._original_twe_long
+                self.set_wallet_exposure_limits()
         out = json.loads(out_json)
         self._log_realized_loss_gate_blocks(out, idx_to_symbol)
         if hasattr(self, "_log_min_effective_cost_blocks"):
