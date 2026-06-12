@@ -831,8 +831,8 @@ panic_all() {
     echo -e "${RED}每个机器人会立即尝试平掉全部仓位！${NC}"
     echo ""
 
-    read -p "确认对所有机器人执行 panic? 输入 YES 确认: " confirm
-    if [ "$confirm" != "YES" ]; then
+    read -p "确认对所有机器人执行 panic? 输入 yes 确认: " confirm
+    if [ "${confirm,,}" != "yes" ]; then
         echo "已取消"
         return 0
     fi
@@ -1088,8 +1088,8 @@ delete_all() {
     echo ""
     echo -e "${RED}此操作不可逆！${NC}"
 
-    read -p "确认删除? 输入 YES 确认: " confirm
-    if [ "$confirm" != "YES" ]; then
+    read -p "确认删除? 输入 yes 确认: " confirm
+    if [ "${confirm,,}" != "yes" ]; then
         echo "已取消"
         return 0
     fi
