@@ -10320,12 +10320,15 @@ class Passivbot:
         twe_was_shrunk = effective_twe_long != self._original_twe_long
         if twe_was_shrunk:
             self.config["bot"]["long"]["total_wallet_exposure_limit"] = effective_twe_long
-            self.set_wallet_exposure_limits()
         try:
             global_bp = {
                 "long": self._bot_params_to_rust_dict("long", None),
                 "short": self._bot_params_to_rust_dict("short", None),
             }
+            if twe_was_shrunk:
+                global_bp["long"]["risk_twel_enforcer_threshold"] *= (
+                    self._original_twe_long / effective_twe_long
+                )
             # Effective hedge_mode = config setting AND exchange capability.
             # If either is False, we block same-coin hedging in the orchestrator.
             effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
@@ -10479,7 +10482,6 @@ class Passivbot:
         finally:
             if twe_was_shrunk:
                 self.config["bot"]["long"]["total_wallet_exposure_limit"] = self._original_twe_long
-                self.set_wallet_exposure_limits()
         out = json.loads(out_json)
         self._log_realized_loss_gate_blocks(out, idx_to_symbol)
         if hasattr(self, "_log_min_effective_cost_blocks"):
@@ -11371,12 +11373,15 @@ class Passivbot:
         twe_was_shrunk = effective_twe_long != self._original_twe_long
         if twe_was_shrunk:
             self.config["bot"]["long"]["total_wallet_exposure_limit"] = effective_twe_long
-            self.set_wallet_exposure_limits()
         try:
             global_bp = {
                 "long": self._bot_params_to_rust_dict("long", None),
                 "short": self._bot_params_to_rust_dict("short", None),
             }
+            if twe_was_shrunk:
+                global_bp["long"]["risk_twel_enforcer_threshold"] *= (
+                    self._original_twe_long / effective_twe_long
+                )
             # Effective hedge_mode = config setting AND exchange capability.
             # If either is False, we block same-coin hedging in the orchestrator.
             effective_hedge_mode = self._config_hedge_mode and self.hedge_mode
@@ -11533,7 +11538,6 @@ class Passivbot:
         finally:
             if twe_was_shrunk:
                 self.config["bot"]["long"]["total_wallet_exposure_limit"] = self._original_twe_long
-                self.set_wallet_exposure_limits()
         out = json.loads(out_json)
         self._log_realized_loss_gate_blocks(out, idx_to_symbol)
         if hasattr(self, "_log_min_effective_cost_blocks"):
