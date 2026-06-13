@@ -3756,6 +3756,16 @@ def _plan_combined_coin(
     )
 
 
+def _fair_coverage(candidate, ref_end_ts: int | None) -> int:
+    if ref_end_ts is None or candidate.df.empty:
+        return candidate.coverage_count
+    col = "valid" if "valid" in candidate.df.columns else None
+    if col is None:
+        return candidate.coverage_count
+    in_window = candidate.df[candidate.df["timestamp"] <= ref_end_ts]
+    return int(in_window[col].sum())
+
+
 def _pick_best_combined_candidate(
     coin: str,
     forced_exchange: Optional[str],
@@ -3772,13 +3782,23 @@ def _pick_best_combined_candidate(
         return chosen[0]
     if len(candidates) == 1:
         return candidates[0]
+    # Normalise the comparison window to the earliest last_ts across all
+    # candidates so that exchanges with a slightly-fresher tail do not
+    # receive an unfair ranking advantage.
+    _last_ts = []
+    for c in candidates:
+        if not c.df.empty and "valid" in c.df.columns:
+            _valid_rows = c.df[c.df["valid"]]
+            if not _valid_rows.empty:
+                _last_ts.append(int(_valid_rows["timestamp"].iloc[-1]))
+    _ref_end_ts = min(_last_ts) if _last_ts else None
     ranked = sorted(
         candidates,
-        key=lambda candidate: (
-            1 if candidate.full_range else 0,
-            candidate.coverage_count,
-            -candidate.gap_count,
-            candidate.total_volume,
+        key=lambda c: (
+            1 if c.full_range else 0,
+            _fair_coverage(c, _ref_end_ts),
+            -c.gap_count,
+            c.total_volume,
         ),
         reverse=True,
     )
@@ -3800,13 +3820,21 @@ def _combined_summary_from_result(
     last_ts = int(df["timestamp"].iloc[-1]) if not df.empty else None
     requested_rows = int((int(end_ts) - int(effective_start_ts)) // 60_000) + 1
     remaining_gap_count = max(0, requested_rows - int(coverage_count))
+    # Allow a tail tolerance so exchanges with slightly-stale tails
+    # (e.g. API delay, chunk pre-allocation near "now") are not
+    # unfairly penalised in the combined ranking.
+    _tail_slack_ms = 24 * 60 * 60 * 1000  # 24 hours
     full_range = (
         first_ts == int(effective_start_ts)
-        and last_ts == int(end_ts)
-        and int(gap_count) == 0
-        and remaining_gap_count == 0
+        and last_ts is not None
+        and last_ts >= int(end_ts) - _tail_slack_ms
+        and remaining_gap_count <= int(_tail_slack_ms // 60_000)
     )
-    effective_gap_count = int(gap_count) if full_range else max(int(gap_count), remaining_gap_count)
+    effective_gap_count = (
+        max(0, int(gap_count) - remaining_gap_count)
+        if full_range
+        else max(int(gap_count), remaining_gap_count)
+    )
     status = "eligible" if full_range else "partial"
     remaining_gaps = ()
     if not full_range:
