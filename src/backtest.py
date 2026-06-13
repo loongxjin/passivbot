@@ -676,6 +676,24 @@ def build_backtest_payload(
         "warmup_minutes_provided": warmup_provided,
     }
 
+    # Trim trailing rows where BTC prices are NaN (store pre-allocation
+    # may leave unfilled monthly chunks).  Must happen before bundle build
+    # so the Rust engine never sees NaN BTC prices.
+    btc_valid = ~np.isnan(btc_usd_prices)
+    if btc_valid.any():
+        last_btc = int(np.flatnonzero(btc_valid)[-1])
+        if last_btc < len(btc_usd_prices) - 1:
+            n_trimmed = len(btc_usd_prices) - last_btc - 1
+            btc_usd_prices = btc_usd_prices[: last_btc + 1]
+            hlcvs = hlcvs[: last_btc + 1]
+            timestamps = timestamps[: last_btc + 1]
+            logging.warning(
+                "[hlcvs] trimmed %d trailing rows without BTC price; "
+                "new end: %s",
+                n_trimmed,
+                ts_to_date(int(timestamps[-1])),
+            )
+
     bundle = _build_hlcvs_bundle(
         hlcvs,
         btc_usd_prices,
@@ -1460,6 +1478,25 @@ def save_coins_hlcvs_to_cache(
     logging.info(f"Dumping cache...")
     json.dump(coins, open(cache_dir / "coins.json", "w"))
     json.dump(mss, open(cache_dir / "market_specific_settings.json", "w"))
+    # BTC prices may trail behind OHLCV data when the store pre-allocates
+    # monthly chunks that have not been filled yet.  Trim all arrays to the
+    # last valid BTC price so the backtest never sees NaN BTC prices.
+    btc_valid = ~np.isnan(btc_usd_prices)
+    if btc_valid.any():
+        last_btc = int(np.flatnonzero(btc_valid)[-1])
+        if last_btc < len(btc_usd_prices) - 1:
+            n_trimmed = len(btc_usd_prices) - last_btc - 1
+            btc_usd_prices = btc_usd_prices[: last_btc + 1]
+            hlcvs = hlcvs[: last_btc + 1]
+            if timestamps is not None:
+                timestamps = timestamps[: last_btc + 1]
+            logging.warning(
+                "[hlcvs] trimmed %d trailing rows (no BTC price); "
+                "new range ends at idx %d (%s)",
+                n_trimmed,
+                last_btc,
+                ts_to_date(int(timestamps[-1])),
+            )
     uncompressed_size = hlcvs.nbytes
     sts = utc_ms()
     if is_compressed:
