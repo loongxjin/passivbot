@@ -1239,7 +1239,12 @@ async def try_prepare_hlcvs_v2_local(
                 if btc_rng is None:
                     continue
                 btc_df, _btc_gap_count = _dense_hlcv_frame_from_sparse_v2_range(btc_rng)
-                btc_prices = btc_df["close"].to_numpy(dtype=np.float64, copy=False)
+                # ffill/bfill BTC close to eliminate NaN from unfilled store rows,
+                # matching the non-V2 and combined exchange paths. Without this,
+                # trailing NaN forces save_coins_hlcvs_to_cache to trim all coins
+                # back to the last valid BTC timestamp, causing a cache-staleness
+                # loop where every run re-fetches everything.
+                btc_prices = btc_df["close"].ffill().bfill().to_numpy(dtype=np.float64, copy=False)
                 btc_source_exchange = btc_exchange
                 break
             finally:
