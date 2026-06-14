@@ -484,8 +484,6 @@ pub struct Backtest<'a> {
     hard_stop_flat_confirmations: usize,
     day_drop_twe_trigger_day_ms: u64, // UTC midnight of day when TWE shrink triggered, 0=none
     twe_long_original: f64,           // saved original total_wallet_exposure_limit for long
-    risk_twel_enforcer_original: f64,
-    risk_wel_enforcer_original: f64,
     hard_stop_pending_stop: Option<HardStopStopSnapshot>,
     hard_stop_last_stop: Option<HardStopStopSnapshot>,
     hard_stop_n_triggers: u32,
@@ -1676,8 +1674,6 @@ impl<'a> Backtest<'a> {
         bot_params_master.long.n_positions = n_coins.min(bot_params_master.long.n_positions);
         bot_params_master.short.n_positions = n_coins.min(bot_params_master.short.n_positions);
         let twe_long_original = bot_params_master.long.total_wallet_exposure_limit;
-        let risk_twel_original = bot_params_master.long.risk_twel_enforcer_threshold;
-        let risk_wel_original = bot_params_master.long.risk_wel_enforcer_threshold;
 
         // Store original bot params to preserve dynamic WEL indicators
         let bot_params_original = bot_params.clone();
@@ -1836,8 +1832,6 @@ impl<'a> Backtest<'a> {
             hard_stop_cooldown_until_ms: None,
             day_drop_twe_trigger_day_ms: 0,
             twe_long_original: twe_long_original,
-            risk_twel_enforcer_original: risk_twel_original,
-            risk_wel_enforcer_original: risk_wel_original,
             hard_stop_flat_confirmations: 0,
             hard_stop_pending_stop: None,
             hard_stop_last_stop: None,
@@ -2184,32 +2178,10 @@ impl<'a> Backtest<'a> {
                     .long
                     .total_wallet_exposure_limit =
                     self.twe_long_original * self.backtest_params.day_drop_twe_multiplier;
-                let ratio = 1.0 / self.backtest_params.day_drop_twe_multiplier;
-                self.bot_params_master
-                    .long
-                    .risk_twel_enforcer_threshold =
-                    self.risk_twel_enforcer_original * ratio;
-                self.bot_params_master
-                    .long
-                    .risk_wel_enforcer_threshold =
-                    self.risk_wel_enforcer_original * ratio;
-                // Invalidate orchestrator cache so per-symbol bot_params are rebuilt
-                self.orchestrator_input_cache = None;
             } else {
-                let was_shrunk = self.bot_params_master.long.risk_twel_enforcer_threshold
-                    != self.risk_twel_enforcer_original;
                 self.bot_params_master
                     .long
                     .total_wallet_exposure_limit = self.twe_long_original;
-                self.bot_params_master
-                    .long
-                    .risk_twel_enforcer_threshold = self.risk_twel_enforcer_original;
-                self.bot_params_master
-                    .long
-                    .risk_wel_enforcer_threshold = self.risk_wel_enforcer_original;
-                if was_shrunk {
-                    self.orchestrator_input_cache = None;
-                }
             }
         }
 
@@ -2232,19 +2204,11 @@ impl<'a> Backtest<'a> {
             if self.bot_params_original[idx].long.wallet_exposure_limit < 0.0 {
                 self.bot_params[idx].long.wallet_exposure_limit = dyn_wel_long_base;
             }
-            self.bot_params[idx].long.risk_twel_enforcer_threshold =
-                self.bot_params_master.long.risk_twel_enforcer_threshold;
-            self.bot_params[idx].long.risk_wel_enforcer_threshold =
-                self.bot_params_master.long.risk_wel_enforcer_threshold;
         }
         for &idx in &eligible_short {
             if self.bot_params_original[idx].short.wallet_exposure_limit < 0.0 {
                 self.bot_params[idx].short.wallet_exposure_limit = dyn_wel_short_base;
             }
-            self.bot_params[idx].short.risk_twel_enforcer_threshold =
-                self.bot_params_master.short.risk_twel_enforcer_threshold;
-            self.bot_params[idx].short.risk_wel_enforcer_threshold =
-                self.bot_params_master.short.risk_wel_enforcer_threshold;
         }
         true
     }
