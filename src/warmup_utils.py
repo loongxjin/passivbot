@@ -31,19 +31,41 @@ def _iter_param_sets(config: dict) -> Iterator[Tuple[str, dict, dict]]:
         yield coin, long_params, short_params
 
 
+def _extract_bound_max(bounds: dict, key: str) -> float:
+    """Extract the maximum value from an optimize bound entry."""
+    if not isinstance(bounds, dict) or key not in bounds:
+        return 0.0
+    entry = bounds[key]
+    candidates = [entry] if isinstance(entry, (list, tuple)) else [[entry]]
+    max_val = 0.0
+    for candidate in candidates:
+        for val in candidate:
+            max_val = max(max_val, _to_float(val))
+    return max_val
+
+
+def _side_may_be_enabled(config: dict, pside: str) -> bool:
+    """Check whether the given pside is or could be enabled.
+
+    Considers both the base bot config and optimize bounds upper limits.
+    A side is "enabled" when TWEL > 0 and n_positions > 0.
+    """
+    bot_cfg = config.get("bot", {}).get(pside, {})
+    bounds = config.get("optimize", {}).get("bounds", {})
+
+    twel_base = _to_float(bot_cfg.get("total_wallet_exposure_limit", 0))
+    npos_base = int(round(_to_float(bot_cfg.get("n_positions", 0))))
+
+    twel_bound = _extract_bound_max(bounds, f"{pside}_total_wallet_exposure_limit")
+    npos_bound = _extract_bound_max(bounds, f"{pside}_n_positions")
+
+    twel = max(twel_base, twel_bound)
+    npos = max(npos_base, int(round(npos_bound)))
+    return twel > 0.0 and npos > 0
+
+
 def compute_backtest_warmup_minutes(config: dict) -> int:
     """Mirror Rust warmup span calculation (see calc_warmup_bars)."""
-
-    def _extract_bound_max(bounds: dict, key: str) -> float:
-        if key not in bounds:
-            return 0.0
-        entry = bounds[key]
-        candidates = [entry] if isinstance(entry, (list, tuple)) else [[entry]]
-        max_val = 0.0
-        for candidate in candidates:
-            for val in candidate:
-                max_val = max(max_val, _to_float(val))
-        return max_val
 
     max_minutes = 0.0
     minute_fields = [
@@ -61,20 +83,16 @@ def compute_backtest_warmup_minutes(config: dict) -> int:
             max_minutes = max(max_minutes, log_span_minutes)
 
     bounds = config.get("optimize", {}).get("bounds", {})
-    bound_keys_minutes = [
-        "long_ema_span_0",
-        "long_ema_span_1",
-        "long_forager_volume_ema_span",
-        "long_forager_volatility_ema_span",
-        "short_ema_span_0",
-        "short_ema_span_1",
-        "short_forager_volume_ema_span",
-        "short_forager_volatility_ema_span",
-    ]
-    bound_keys_hours = [
-        "long_entry_volatility_ema_span_hours",
-        "short_entry_volatility_ema_span_hours",
-    ]
+    # Only consider optimize bounds for sides that are actually enabled.
+    # Bounds for disabled sides may hold large placeholder values that would
+    # inflate the warmup beyond the available data window.
+    enabled_sides = [pside for pside in ("long", "short") if _side_may_be_enabled(config, pside)]
+    bound_keys_minutes = []
+    bound_keys_hours = []
+    for pside in enabled_sides:
+        for field in minute_fields:
+            bound_keys_minutes.append(f"{pside}_{field}")
+        bound_keys_hours.append(f"{pside}_entry_volatility_ema_span_hours")
 
     for key in bound_keys_minutes:
         max_minutes = max(max_minutes, _extract_bound_max(bounds, key))
