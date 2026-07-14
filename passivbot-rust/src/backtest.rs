@@ -2062,15 +2062,16 @@ impl<'a> Backtest<'a> {
         self.hard_stop_no_restart_latched = false;
         self.hard_stop_cooldown_until_ms = None;
 
-        // Push NaN to equities to mark the liquidation point for plotting
+        // Push NaN to equities to mark the liquidation point for plotting.
+        // Offset by +1 ms to avoid duplicate timestamp with the zeroed entry
+        // left by check_and_apply_liquidation above.
         let ts = self.first_timestamp_ms + (k as u64) * self.interval_ms;
-        self.equities.timestamps_ms.push(ts);
+        self.equities.timestamps_ms.push(ts + 1);
         self.equities.usd_total_equity.push(f64::NAN);
         self.equities.btc_total_equity.push(f64::NAN);
 
         // Then push the restored balance as the new equity starting point
-        // Use ts + 1 to avoid duplicate-index dropping in Python post-processing
-        self.equities.timestamps_ms.push(ts + 1);
+        self.equities.timestamps_ms.push(ts + 2);
         self.equities.usd_total_equity.push(self.balance.usd_total_balance);
         let btc_price = self.btc_usd_prices[k].max(f64::EPSILON);
         self.equities.btc_total_equity.push(self.balance.usd_total_balance / btc_price);

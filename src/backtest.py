@@ -1006,6 +1006,12 @@ def process_forager_fills(
         )
     equities_array = np.asarray(equities_array)
     equities_index = pd.to_datetime(equities_array[:, 0].astype(np.int64), unit="ms")
+    # Deduplicate: keep last (non-nan) entry for each timestamp
+    if hasattr(equities_index, 'duplicated'):
+        dup_mask = equities_index.duplicated(keep='last')
+        if dup_mask.any():
+            equities_array = equities_array[~np.asarray(dup_mask)]
+            equities_index = equities_index[~dup_mask]
     edf = pd.Series(
         equities_array[:, 1],
         index=equities_index,
