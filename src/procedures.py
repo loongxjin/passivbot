@@ -322,8 +322,15 @@ async def get_first_timestamps_unified(coins: List[str], exchange: str = None):
             return await cc.fetch_ohlcv(symbol, since=int(date_to_ts("2018-01-01")), timeframe="1d")
 
         elif exchange_name == "okx":
-            # Monthly timeframe; data since 2018
-            return await cc.fetch_ohlcv(symbol, since=int(date_to_ts("2018-01-01")), timeframe="1M")
+            # Use market listing time as `since` to avoid OKX returning 0 rows
+            # when the query starts before the contract was actually listed.
+            if not cc.markets:
+                await cc.load_markets()
+            market = cc.market(symbol)
+            list_time_ms = int(market.get("info", {}).get("listTime", 0) or 0)
+            if list_time_ms > 0:
+                return await cc.fetch_ohlcv(symbol, since=list_time_ms, timeframe="1d")
+            return await cc.fetch_ohlcv(symbol, since=int(date_to_ts("2018-01-01")), timeframe="1d")
 
         elif exchange_name == "bitget":
             first_candle = await get_first_ohlcv_iteratively(cc, symbol)

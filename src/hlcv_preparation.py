@@ -1144,6 +1144,14 @@ async def try_prepare_hlcvs_v2_local(
     try:
         await om.load_markets()
         first_timestamps_unified = await get_first_timestamps_unified(coins)
+        # Exchange-specific first timestamps: when a coin is listed on other
+        # exchanges earlier than on this one, the cross-exchange unified minimum
+        # may be before this exchange's actual data starts.  Using that earlier
+        # timestamp as the fetch start causes OKX (and similar exchanges) to
+        # return zero rows when `since` precedes the listing date.
+        first_timestamps_exchange_specific = await get_first_timestamps_unified(
+            coins, exchange=store_exchange
+        )
         catalog = OhlcvCatalog(Path("caches") / "ohlcvs" / "catalog.sqlite")
         store = OhlcvStore(Path("caches") / "ohlcvs", catalog)
         mss = {}
@@ -1162,6 +1170,17 @@ async def try_prepare_hlcvs_v2_local(
             first_ts_guess = om.load_first_timestamp(coin)
             if not first_ts_guess:
                 first_ts_guess = float(first_timestamps_unified[coin])
+            # Prefer the exchange-specific first timestamp so we don't request
+            # data before this exchange actually listed the coin.
+            ex_specific_fts = float(first_timestamps_exchange_specific.get(coin, 0.0) or 0.0)
+            if ex_specific_fts > 0.0:
+                first_ts_guess = max(first_ts_guess, ex_specific_fts)
+            else:
+                # Not listed on this exchange; skip (can't fetch from here)
+                logging.info(
+                    "[%s] v2 local skip coin not available on exchange %s", exchange, coin
+                )
+                continue
             if first_ts_guess > end_ts:
                 continue
 
