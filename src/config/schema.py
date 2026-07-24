@@ -389,6 +389,7 @@ def get_template_config():
                 "day_drop_twe_threshold_pct": 0.0,
                 "day_drop_twe_multiplier": 0.0,
                 "initial_entry_exec_max_market_dist_pct": 0.005,
+                "limit_order_create_max_market_dist_pct": 0.8,
                 "order_match_tolerance_pct": 0.0002,
                 "pnls_max_lookback_days": 30,
                 "recv_window_ms": 10000,

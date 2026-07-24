@@ -203,6 +203,11 @@ def _has_tradfi_provider_config() -> bool:
         return False
 
 
+def _has_explicit_ohlcv_source_dir(config: dict) -> bool:
+    backtest = config.get("backtest", {}) if isinstance(config, dict) else {}
+    return bool(str(backtest.get("ohlcv_source_dir") or "").strip())
+
+
 class HLCVManager:
     """Backtest-oriented OHLCV manager using CandlestickManager for fetching/caching."""
 
@@ -936,6 +941,8 @@ async def prepare_hlcvs(
     force_refetch_gaps: bool = False,
     skip_v2_local: bool = False,
 ):
+    if _has_explicit_ohlcv_source_dir(config):
+        skip_v2_local = True
     if not skip_v2_local:
         try:
             local_v2 = await try_prepare_hlcvs_v2_local(
@@ -3269,6 +3276,7 @@ async def prepare_hlcvs_combined(
     *,
     force_refetch_gaps: bool = False,
 ):
+    use_v2_local = not _has_explicit_ohlcv_source_dir(config)
     backtest_exchanges = require_config_value(config, "backtest.exchanges")
     exchanges_to_consider = [to_ccxt_exchange_id(e) for e in backtest_exchanges]
     forced_sources = forced_sources or {}
@@ -3365,6 +3373,7 @@ async def prepare_hlcvs_combined(
             catalog=catalog,
             store=store,
             legacy_root=legacy_root,
+            use_v2_local=use_v2_local,
         )
 
         btc_df, btc_source_exchange = await _load_combined_btc_prices(
@@ -3372,6 +3381,8 @@ async def prepare_hlcvs_combined(
             timestamps=timestamps,
             effective_start_date=effective_start_date,
             end_date=end_date,
+            ohlcv_source_dir=config.get("backtest", {}).get("ohlcv_source_dir"),
+            use_v2_local=use_v2_local,
             gap_tolerance_ohlcvs_minutes=require_config_value(
                 config, "backtest.gap_tolerance_ohlcvs_minutes"
             ),
@@ -3454,6 +3465,7 @@ async def _prepare_hlcvs_combined_impl(
     catalog: OhlcvCatalog,
     store: OhlcvStore,
     legacy_root: Path | None,
+    use_v2_local: bool = True,
 ):
     market_settings_sources = market_settings_sources or {}
     # Clamp end_ts to now so the OhlcvStore never fetches or pre-allocates
@@ -3519,6 +3531,7 @@ async def _prepare_hlcvs_combined_impl(
             catalog=catalog,
             store=store,
             legacy_root=legacy_root,
+            use_v2_local=use_v2_local,
             candidate_report=candidate_report,
         )
         for coin in coins
@@ -3981,6 +3994,7 @@ async def _resolve_combined_coin(
     catalog: OhlcvCatalog,
     store: OhlcvStore,
     legacy_root: Path | None,
+    use_v2_local: bool = True,
     candidate_report: list[dict] | None = None,
 ) -> Optional[CombinedCoinResolution]:
     async with sem:
@@ -4011,6 +4025,7 @@ async def _resolve_combined_coin(
                 store=store,
                 legacy_root=legacy_root,
                 exchanges_to_consider=exchanges_to_consider,
+                use_v2_local=use_v2_local,
                 candidate_report=candidate_report,
             )
             if not candidates:
@@ -4058,6 +4073,7 @@ async def _load_combined_coin_candidates(
     store: OhlcvStore,
     legacy_root: Path | None,
     exchanges_to_consider: Sequence[str],
+    use_v2_local: bool = True,
     candidate_report: list[dict] | None = None,
 ) -> list[CombinedExchangeCandidate]:
     tasks = []
@@ -4075,7 +4091,7 @@ async def _load_combined_coin_candidates(
                     catalog=catalog,
                     store=store,
                     legacy_root=legacy_root,
-                    use_v2_local=True,
+                    use_v2_local=use_v2_local,
                 )
             )
         )
@@ -4121,7 +4137,7 @@ async def _load_combined_coin_candidates(
             if candidate_report is not None:
                 candidate_report.append(summary.to_dict())
             continue
-        source_layer = "v2_store"
+        source_layer = "v2_store" if use_v2_local else "source_dir"
         candidate, summary = _combined_summary_from_result(
             coin=plan.coin,
             exchange=ex,
@@ -4148,6 +4164,8 @@ async def _load_combined_btc_prices(
     catalog: OhlcvCatalog,
     store: OhlcvStore,
     legacy_root: Path | None,
+    ohlcv_source_dir: str | None = None,
+    use_v2_local: bool = True,
 ) -> tuple[pd.DataFrame, Optional[str]]:
     btc_candidates = [
         exchanges_to_consider[0] if len(exchanges_to_consider) == 1 else "binanceusdm"
@@ -4163,6 +4181,7 @@ async def _load_combined_btc_prices(
             end_date,
             gap_tolerance_ohlcvs_minutes=gap_tolerance_ohlcvs_minutes,
             force_refetch_gaps=force_refetch_gaps,
+            ohlcv_source_dir=ohlcv_source_dir if not use_v2_local else None,
         )
         try:
             btc_om.update_date_range(int(timestamps[0]), int(timestamps[-1]))
@@ -4174,6 +4193,13 @@ async def _load_combined_btc_prices(
             )
             await btc_om.load_markets()
             if not btc_om.has_coin("BTC"):
+                continue
+            if not use_v2_local:
+                btc_df = await btc_om.get_ohlcvs("BTC")
+                if not btc_df.empty:
+                    btc_source_exchange = btc_exchange
+                    logging.info("using BTC/USD benchmark direct source dir from %s", btc_exchange)
+                    return btc_df.loc[:, ["timestamp", "close"]], btc_source_exchange
                 continue
             btc_symbol = btc_om.get_symbol("BTC")
             btc_rng = await _resolve_v2_store_range(
@@ -4330,12 +4356,14 @@ async def fetch_data_for_coin_and_exchange(
     intervals = np.diff(df["timestamp"].values)
     gap_count = sum((gap // 60_000) - 1 for gap in intervals if gap > 60_000)
     total_volume = df["volume"].sum()
+    source_layer = "source_dir" if getattr(om, "ohlcv_source_dir", None) else "remote"
     logging.info(
-        "%s candles load ok coin=%s rows=%d gaps=%d source=remote elapsed_s=%.1f",
+        "%s candles load ok coin=%s rows=%d gaps=%d source=%s elapsed_s=%.1f",
         ex,
         coin,
         coverage_count,
         gap_count,
+        source_layer,
         time.monotonic() - t0,
     )
     return (ex, df, coverage_count, gap_count, total_volume)

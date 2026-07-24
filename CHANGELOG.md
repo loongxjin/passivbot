@@ -4,6 +4,13 @@ All notable user-facing changes will be documented in this file.
 
 ## Unreleased
 
+- Added `live.limit_order_create_max_market_dist_pct` with a default of `0.8`
+  so live skips limit-order creations far outside fresh market price bands
+  instead of repeatedly submitting exchange-invalid deep orders.
+- Fixed Bitget UTA / Elite close-order placement by omitting the one-way-only
+  `reduceOnly` flag from hedge-mode v3 orders that already send `posSide`.
+- Fixed Bitget UTA / Elite open-order normalization so hedge-mode close orders
+  keep their exchange-reported `side` instead of being misread as entries.
 - Added Bitget UTA / Elite copy-trading account support with v3 API routing for
   balance, orders, and fill-event history while keeping classic Bitget accounts
   on the existing v2/mix paths.
@@ -60,6 +67,9 @@ All notable user-facing changes will be documented in this file.
 - Added optimizer `--resume` checkpoint recovery safeguards: resume now requires a
   readable checkpoint plus prior `all_results.bin` metadata, rejects changed optimizer
   search domains before appending results, and exits non-zero on fatal optimizer errors.
+- Changed explicit `backtest.ohlcv_source_dir` backtest/optimizer runs to read that
+  caller-managed OHLCV tree directly instead of first importing it into PB7's v2 raw
+  `caches/ohlcvs` store; the final prepared HLCV cache is still written normally.
 
 ## v7.12.0 - 2026-05-27
 
