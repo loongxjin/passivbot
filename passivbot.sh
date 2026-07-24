@@ -14,6 +14,7 @@
 #   ./passivbot.sh logs <服务名> [行数]                # 查看日志
 #   ./passivbot.sh configs                             # 列出可用配置和API key
 #   ./passivbot.sh check                               # 运行配置兼容性检查
+#   ./passivbot.sh leverage <服务名> <n_positions> <twe>  # 调整杠杆并重启
 #   ./passivbot.sh clean-logs [保留天数]               # 清理历史日志
 
 set -e
@@ -94,6 +95,12 @@ show_help() {
     echo ""
     echo -e "  ${GREEN}check${NC}"
     echo "      运行配置兼容性检查（v7.7b → v7.10.0）"
+    echo ""
+    echo -e "  ${GREEN}leverage${NC} <服务名> <n_positions> <twe>"
+    echo "      调整 bot.long 的 n_positions 和 total_wallet_exposure_limit（即杠杆）"
+    echo "      修改后会自动重启服务使配置生效"
+    echo "      例: $0 leverage okx_btc 3 2.0"
+    echo "          n_positions=3, total_wallet_exposure_limit=2.0"
     echo ""
   echo -e "  ${RED}panic${NC} <服务名> [--market]"
   echo "      一键 panic 指定机器人（设为 panic 模式并重启）"
@@ -762,6 +769,143 @@ except OSError as e:
     echo -e "${GREEN}全部检查通过${NC}"
 }
 
+set_leverage() {
+    local service_name=$(get_service_name "$1")
+    local n_positions="$2"
+    local twe="$3"
+
+    echo "========================================"
+    echo "调整杠杆 (bot.long)"
+    echo "========================================"
+    echo ""
+
+    if [ -z "$service_name" ]; then
+        echo -e "${RED}错误: 请指定服务名${NC}"
+        echo "用法: $0 leverage <服务名> <n_positions> <twe>"
+        return 1
+    fi
+
+    if [ -z "$n_positions" ] || [ -z "$twe" ]; then
+        echo -e "${RED}错误: 需要提供 n_positions 和 total_wallet_exposure_limit${NC}"
+        echo "用法: $0 leverage <服务名> <n_positions> <twe>"
+        echo "例:  $0 leverage okx_btc 3 2.0"
+        return 1
+    fi
+
+    # 校验 n_positions: 正整数
+    if ! [[ "$n_positions" =~ ^[1-9][0-9]*$ ]]; then
+        echo -e "${RED}错误: n_positions 必须是正整数 (收到: '$n_positions')${NC}"
+        return 1
+    fi
+
+    # 校验 twe: 正数 (整数或小数)
+    if ! [[ "$twe" =~ ^[0-9]+\.?[0-9]*$ ]] || [ "$(echo "$twe <= 0" | bc -l 2>/dev/null || echo 1)" = "1" ]; then
+        echo -e "${RED}错误: total_wallet_exposure_limit 必须是正数 (收到: '$twe')${NC}"
+        return 1
+    fi
+
+    if [ ! -f "$SYSTEMD_DIR/$service_name.service" ]; then
+        echo -e "${RED}错误: 服务 '$service_name' 不存在${NC}"
+        return 1
+    fi
+
+    # 提取配置文件路径
+    local config_rel=$(grep "ExecStart=" "$SYSTEMD_DIR/$service_name.service" 2>/dev/null | grep -oP 'configs/[^[:space:]]+\.json' || echo "")
+    if [ -z "$config_rel" ]; then
+        echo -e "${RED}错误: 无法从服务文件提取配置路径${NC}"
+        return 1
+    fi
+    local config_file="$PASSIVBOT_DIR/$config_rel"
+
+    if [ ! -f "$config_file" ]; then
+        echo -e "${RED}错误: 配置文件不存在: $config_file${NC}"
+        return 1
+    fi
+
+    # 读取当前值用于展示
+    local current=$(python3 -c "
+import json, sys
+try:
+    with open('$config_file') as f:
+        d = json.load(f)
+except Exception as e:
+    print(f'ERR|读取配置失败: {e}', file=sys.stderr)
+    sys.exit(1)
+lg = d.get('bot', {}).get('long', {})
+np = lg.get('n_positions', None)
+twe = lg.get('total_wallet_exposure_limit', None)
+print(f'{np}|{twe}')
+" 2>&1)
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}$current${NC}"
+        return 1
+    fi
+    local cur_np="${current%%|*}"
+    local cur_twe="${current##*|}"
+
+    echo -e "服务: ${CYAN}$service_name${NC}"
+    echo -e "配置: $config_rel"
+    echo ""
+    echo "bot.long 参数变更:"
+    echo -e "  n_positions:                  ${YELLOW}${cur_np:-未设置}${NC} → ${GREEN}${n_positions}${NC}"
+    echo -e "  total_wallet_exposure_limit:  ${YELLOW}${cur_twe:-未设置}${NC} → ${GREEN}${twe}${NC}"
+    echo ""
+
+    # 用 Python 修改配置（原子写入: 先写临时文件再替换）
+    python3 -c "
+import json, os, sys, tempfile
+
+config_path = '$config_file'
+try:
+    with open(config_path, 'r') as f:
+        cfg = json.load(f)
+except Exception as e:
+    print(f'错误: 无法读取配置: {e}', file=sys.stderr)
+    sys.exit(1)
+
+cfg.setdefault('bot', {})
+cfg['bot'].setdefault('long', {})
+cfg['bot']['long']['n_positions'] = $n_positions
+cfg['bot']['long']['total_wallet_exposure_limit'] = $twe
+
+# 原子写入: 同目录临时文件 -> rename
+d = os.path.dirname(config_path)
+fd, tmp = tempfile.mkstemp(dir=d, suffix='.tmp')
+try:
+    with os.fdopen(fd, 'w') as f:
+        json.dump(cfg, f, indent=4, ensure_ascii=False)
+    os.replace(tmp, config_path)
+except Exception as e:
+    try:
+        os.unlink(tmp)
+    except OSError:
+        pass
+    print(f'错误: 无法写入配置: {e}', file=sys.stderr)
+    sys.exit(1)
+
+print('配置修改成功')
+"
+    if [ $? -ne 0 ]; then
+        echo -e "${RED}配置修改失败${NC}"
+        return 1
+    fi
+
+    echo -e "${GREEN}配置已修改${NC}"
+    echo ""
+
+    # 自动重启服务使配置生效
+    echo "重启服务使配置生效..."
+    sudo systemctl restart "$service_name"
+    sleep 3
+
+    if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+        echo -e "${GREEN}服务已重启，新杠杆已生效！${NC}"
+    else
+        echo -e "${RED}服务启动失败，请检查日志${NC}"
+        echo "查看日志: $0 logs $1"
+    fi
+}
+
 panic_single() {
     local input_name="$1"
     local market_flag="${2:-}"
@@ -1313,6 +1457,10 @@ main() {
             ;;
         check)
             run_config_check
+            ;;
+        leverage|lev|lv)
+            shift
+            set_leverage "$1" "$2" "$3"
             ;;
         panic|p)
             shift
