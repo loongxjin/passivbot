@@ -10743,21 +10743,80 @@ class Passivbot:
                     self.config, "max_ohlcv_fetches_per_minute", 0
                 )
                 try:
-                    max_calls_i = int(max_calls) if max_calls is not None else 0
+                    max_calls = int(max_calls) if max_calls is not None else 0
                 except Exception:
-                    max_calls_i = 0
-                secondary_max_age_ms = int(
-                    Passivbot._forager_target_staleness_ms(
-                        self, len(secondary_symbols), max_calls_i
+                    max_calls = 0
+                # Only refresh secondary symbols when there is at least one open
+                # forager slot; a full book can't deploy new positions, so burning
+                # the API budget on candidate candles is wasted. Mirrors the
+                # validated cc8f39fc "Improve staged candle refresh budgeting".
+                slots_open_any = False
+                for pside in ("long", "short"):
+                    if not is_forager_mode(pside):
+                        continue
+                    try:
+                        max_n = int(self.get_max_n_positions(pside))
+                    except Exception:
+                        max_n = 0
+                    try:
+                        current_n = int(self.get_current_n_positions(pside))
+                    except Exception:
+                        current_n = len(self.get_symbols_with_pos(pside))
+                    if max_n > current_n:
+                        slots_open_any = True
+                        break
+                if max_calls > 0 and slots_open_any:
+                    cycle_cap = max(1, int(math.ceil(float(max_calls) / 4.0)))
+                    budget = self._token_bucket_budget(
+                        "_forager_active_candle_refresh_state",
+                        max_calls,
+                        max_cycle_budget=cycle_cap,
+                        initial_tokens=cycle_cap,
+                    )
+                    secondary_max_age_ms = max(
+                        60_000,
+                        int(
+                            Passivbot._forager_target_staleness_ms(
+                                self, len(secondary_symbols), max_calls
+                            )
+                        ),
+                    )
+                else:
+                    # No slot open or no budget: secondary stays cache-only this
+                    # cycle. _compute_fetch_budget_ttls with budget 0 assigns the
+                    # cache-only TTL to every secondary symbol.
+                    budget = 0
+                    secondary_max_age_ms = int(
+                        getattr(self, "inactive_coin_candle_ttl_ms", 600_000)
+                    )
+                # Symbols within the budget get the real TTL (remote refresh);
+                # the rest get the cache-only TTL (local data only).
+                secondary_ttls, cache_only_never_fetched = (
+                    self._compute_fetch_budget_ttls(
+                        secondary_symbols, secondary_max_age_ms, budget
                     )
                 )
                 now_ms = utc_ms()
-                cache_only_never_fetched = set()
-                stale_unavailable = set()
-                for sym in secondary_symbols:
-                    cache_only_symbols.add(sym)
-                    m1_max_age_by_symbol[sym] = cache_only_ttl
-                    h1_max_age_by_symbol[sym] = cache_only_ttl
+                stale_unavailable: set = set()
+                for sym, ttl in secondary_ttls.items():
+                    ttl_int = int(ttl)
+                    if ttl_int >= cache_only_ttl:
+                        cache_only_symbols.add(sym)
+                    m1_max_age_by_symbol[sym] = ttl_int
+                    # 1h candles are expensive to refresh; floor non-cache-only
+                    # TTLs at 10 minutes, matching the validated health version.
+                    h1_max_age_by_symbol[sym] = (
+                        ttl_int
+                        if ttl_int >= cache_only_ttl
+                        else max(600_000, ttl_int)
+                    )
+                    # Budget allocation above may grant a real TTL to a symbol
+                    # whose local data is in fact unusable. Re-check every
+                    # secondary for never-fetched / stale-beyond-target so the
+                    # orchestrator still marks them unavailable and skips them,
+                    # independent of which TTL bucket they landed in. An in-budget
+                    # symbol with extremely stale local history (e.g. never really
+                    # fetched, last_refresh ~= 0) still can't yield a usable EMA.
                     try:
                         never_fetched = int(self.cm.get_last_refresh_ms(sym) or 0) <= 0
                     except Exception:
@@ -10772,12 +10831,13 @@ class Passivbot:
                         stale_unavailable.add(sym)
                 cache_only_never_fetched.update(stale_unavailable)
                 logging.debug(
-                    "[candle] orchestrator forager EMA cache-only priority=%d secondary=%d budget=0 max_staleness=%ds unavailable=%d max_ohlcv_fetches_per_minute=%d",
+                    "[candle] orchestrator forager EMA budget priority=%d secondary=%d slots_open=%s budget=%d target_age=%ds unavailable=%d",
                     len(priority_symbols),
                     len(secondary_symbols),
+                    "yes" if slots_open_any else "no",
+                    int(budget),
                     int(secondary_max_age_ms / 1000),
                     len(cache_only_never_fetched),
-                    int(max_calls_i),
                 )
             else:
                 cache_only_never_fetched = set()
