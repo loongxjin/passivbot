@@ -239,7 +239,12 @@ async def test_detect_foreign_passivbot_orders_ignores_manual_and_prestart_order
     stale_custom_id = _pb_custom_id("entry_grid_normal_long", "stale")
     bot.orders_emitted_to_exchange = [
         {
-            "timestamp": 1_100_000 - pb_mod.FOREIGN_PASSIVBOT_LOOKBACK_MS - 1,
+            "timestamp": (
+                1_100_000
+                - pb_mod.FOREIGN_PASSIVBOT_LOOKBACK_MS
+                - pb_mod.FOREIGN_PASSIVBOT_PRUNE_MARGIN_MS
+                - 1
+            ),
             "exchange_id": "",
             "custom_id": stale_custom_id,
             "canonical_custom_id": stale_custom_id,
@@ -333,7 +338,12 @@ def test_ambiguous_create_records_use_shorter_prune_window():
     ambiguous_custom_id = _pb_custom_id("entry_grid_normal_long", "amb")
     bot.orders_emitted_to_exchange = [
         {
-            "timestamp": now_ts - pb_mod.FOREIGN_PASSIVBOT_AMBIGUOUS_CREATE_LOOKBACK_MS - 1,
+            "timestamp": (
+                now_ts
+                - pb_mod.FOREIGN_PASSIVBOT_AMBIGUOUS_CREATE_LOOKBACK_MS
+                - pb_mod.FOREIGN_PASSIVBOT_PRUNE_MARGIN_MS
+                - 1
+            ),
             "exchange_id": "",
             "custom_id": ambiguous_custom_id,
             "canonical_custom_id": "0x0004-amb",
@@ -371,6 +381,53 @@ def test_ambiguous_create_records_use_shorter_prune_window():
         "0x0004-amb",
         "0x0004-ack",
     ]
+
+
+@pytest.mark.asyncio
+async def test_detect_foreign_passivbot_orders_keeps_record_at_lookback_boundary():
+    """An open order at the 24h boundary must not be flagged as foreign.
+
+    Record timestamps are captured pre-submission (executor emitted_ts) and
+    therefore precede the exchange order timestamp by the API round-trip.
+    Without the prune margin, a still-open order loses its record ~1s before it
+    leaves the detection window and is falsely flagged as a foreign writer.
+    """
+    import passivbot as pb_mod
+
+    start_ts = 1_000_000
+    now_ts = start_ts + pb_mod.FOREIGN_PASSIVBOT_LOOKBACK_MS + 30_000
+    bot = _make_detection_bot(now_ts=now_ts, start_ts=start_ts)
+    custom_id = _pb_custom_id("entry_grid_normal_long", "boundary")
+    # Record pre-dates the detection cutoff, but stays inside the prune margin.
+    record_ts = now_ts - pb_mod.FOREIGN_PASSIVBOT_LOOKBACK_MS - 500
+    bot.orders_emitted_to_exchange = [
+        {
+            "timestamp": record_ts,
+            "exchange_id": "boundary-1",
+            "custom_id": custom_id,
+            "canonical_custom_id": custom_id,
+            "pb_type": "entry_grid_normal_long",
+            "status": "acknowledged",
+            "fingerprint": None,
+        }
+    ]
+    # Exchange timestamp lands inside the detection window (API round-trip skew).
+    order = {
+        "id": "boundary-1",
+        "symbol": "BTC/USDT:USDT",
+        "side": "buy",
+        "position_side": "long",
+        "qty": 0.01,
+        "price": 100000.0,
+        "reduce_only": False,
+        "timestamp": now_ts - pb_mod.FOREIGN_PASSIVBOT_LOOKBACK_MS + 1,
+        "custom_id": custom_id,
+    }
+
+    await pb_mod.Passivbot._detect_foreign_passivbot_orders(bot, [order])
+
+    assert bot.foreign_passivbot_seen == {}
+    assert bot.stop_signal_received is False
 
 
 @pytest.mark.asyncio

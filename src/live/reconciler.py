@@ -366,9 +366,18 @@ def emitted_order_records(bot) -> list[dict]:
 def prune_emitted_order_custom_ids(bot, now_ts: int) -> None:
     """Drop emitted order records outside the foreign-writer lookback window."""
     now_ts = int(now_ts)
-    acknowledged_cutoff_ts = now_ts - _pb_const("FOREIGN_PASSIVBOT_LOOKBACK_MS")
-    ambiguous_cutoff_ts = now_ts - _pb_const(
-        "FOREIGN_PASSIVBOT_AMBIGUOUS_CREATE_LOOKBACK_MS"
+    # Records outlive the detection lookback by a margin so an order near the
+    # boundary (whose exchange timestamp is later than the pre-submission
+    # emitted_ts) can never lose its record before it leaves the window.
+    acknowledged_cutoff_ts = (
+        now_ts
+        - _pb_const("FOREIGN_PASSIVBOT_LOOKBACK_MS")
+        - _pb_const("FOREIGN_PASSIVBOT_PRUNE_MARGIN_MS")
+    )
+    ambiguous_cutoff_ts = (
+        now_ts
+        - _pb_const("FOREIGN_PASSIVBOT_AMBIGUOUS_CREATE_LOOKBACK_MS")
+        - _pb_const("FOREIGN_PASSIVBOT_PRUNE_MARGIN_MS")
     )
     short_lived_statuses = {"submitted", "create_error_ambiguous"}
     kept = []

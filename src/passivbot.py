@@ -136,6 +136,12 @@ FOREIGN_PASSIVBOT_WINDOW_MS = 60 * 60 * 1000
 FOREIGN_PASSIVBOT_MAX_UNIQUE_PER_WINDOW = 3
 FOREIGN_PASSIVBOT_FINGERPRINT_MATCH_MS = 5 * 60 * 1000
 FOREIGN_PASSIVBOT_AMBIGUOUS_CREATE_LOOKBACK_MS = 15 * 60 * 1000
+# Emitted-order records are retained slightly longer than the detection
+# lookback so orders near the window boundary never outlive their own
+# records (emitted_ts is captured pre-submission and precedes the exchange
+# order timestamp by the API round-trip; without this margin a still-open
+# order is falsely flagged as a foreign Passivbot writer exactly 24h later).
+FOREIGN_PASSIVBOT_PRUNE_MARGIN_MS = 60 * 1000
 
 from custom_endpoint_overrides import (
     apply_rest_overrides_to_ccxt,
