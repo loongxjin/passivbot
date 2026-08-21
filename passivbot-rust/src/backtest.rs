@@ -10,8 +10,8 @@ use crate::orchestrator::{
 use crate::trailing::{reset_trailing_bundle, update_trailing_bundle_with_candle};
 use crate::types::{
     BacktestParams, Balance, BotParams, BotParamsPair, EMABands, Equities,
-    EquityHardStopLossConfig, ExchangeParams, Fill, Order, OrderBook, OrderType, Position,
-    Positions, TrailingPriceBundle,
+    EquityHardStopLossConfig, ExchangeParams, Fill, LiquidationEvent, LiquidationPosition, Order,
+    OrderBook, OrderType, Position, Positions, TrailingPriceBundle,
 };
 use crate::utils::{
     calc_auto_unstuck_allowance, calc_new_psize_pprice, calc_pnl_long, calc_pnl_short,
@@ -524,6 +524,7 @@ pub struct Backtest<'a> {
     hard_stop_no_restart_peak_strategy_equity: f64,
     liquidated: bool,
     n_liquidations: u32,
+    liquidation_events: Vec<LiquidationEvent>,
     final_hard_stop_metrics: Option<HardStopMetrics>,
     final_strategy_equity_metrics: Option<StrategyEquityMetricsBundle>,
 }
@@ -1873,6 +1874,7 @@ impl<'a> Backtest<'a> {
             hard_stop_no_restart_peak_strategy_equity: 0.0,
             liquidated: false,
             n_liquidations: 0,
+            liquidation_events: Vec::new(),
             final_hard_stop_metrics: None,
             final_strategy_equity_metrics: None,
             // EMAs already initialized in `emas`; no rolling buffers needed
@@ -1885,6 +1887,10 @@ impl<'a> Backtest<'a> {
 
     pub fn n_liquidations(&self) -> u32 {
         self.n_liquidations
+    }
+
+    pub fn liquidation_events(&self) -> &[LiquidationEvent] {
+        &self.liquidation_events
     }
 
     pub fn run(&mut self) -> Result<(Vec<Fill>, Equities), String> {
@@ -2022,6 +2028,26 @@ impl<'a> Backtest<'a> {
     /// Reset account state after liquidation: restore balance to starting_balance,
     /// clear all positions and related state, then continue from current K-line.
     fn reset_after_liquidation(&mut self, k: usize) {
+        // Snapshot held positions before clearing: which coins caused the liquidation.
+        let mut held: Vec<LiquidationPosition> = Vec::new();
+        for (pside_name, positions) in [
+            ("long", &self.positions.long),
+            ("short", &self.positions.short),
+        ] {
+            for (&idx, pos) in positions.iter() {
+                if pos.size == 0.0 {
+                    continue;
+                }
+                held.push(LiquidationPosition {
+                    coin: self.backtest_params.coins[idx].clone(),
+                    pside: pside_name.to_string(),
+                    size: pos.size.abs(),
+                    price: pos.price,
+                });
+            }
+        }
+        held.sort_by(|a, b| a.coin.cmp(&b.coin).then(a.pside.cmp(&b.pside)));
+
         let starting = self.backtest_params.starting_balance.max(0.0);
         self.balance.usd_cash_wallet = starting;
         self.balance.usd_total_balance = starting;
@@ -2069,6 +2095,11 @@ impl<'a> Backtest<'a> {
         self.equities.timestamps_ms.push(ts + 1);
         self.equities.usd_total_equity.push(f64::NAN);
         self.equities.btc_total_equity.push(f64::NAN);
+        // Event timestamp matches the NaN marker so Python can join the two.
+        self.liquidation_events.push(LiquidationEvent {
+            timestamp_ms: ts + 1,
+            positions: held,
+        });
 
         // Then push the restored balance as the new equity starting point
         self.equities.timestamps_ms.push(ts + 2);
@@ -4929,6 +4960,8 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5002,6 +5035,8 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5070,6 +5105,8 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5142,6 +5179,8 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5203,6 +5242,8 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5283,6 +5324,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5373,6 +5416,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5456,6 +5501,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5534,6 +5581,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5610,6 +5659,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5678,6 +5729,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5747,6 +5800,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -5829,6 +5884,8 @@ mod tests {
                 forager_score_hysteresis_pct: 0.0,
                 candle_interval_minutes: 1,
                 allow_liquidation_reset: false,
+                day_drop_twe_threshold_pct: 0.0,
+                day_drop_twe_multiplier: 0.0,
             };
 
             let mut bt = Backtest::new(
@@ -5907,6 +5964,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -6002,6 +6061,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -6080,6 +6141,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -6175,6 +6238,8 @@ mod tests {
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bp_pair = BotParamsPair::default();
@@ -6322,6 +6387,8 @@ mod tests {
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bp_pair = BotParamsPair::default();
@@ -6443,6 +6510,8 @@ mod tests {
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bp_pair = BotParamsPair::default();
@@ -6535,6 +6604,8 @@ mod tests {
             equity_hard_stop_loss: EquityHardStopLossConfig::default(),
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -6637,6 +6708,8 @@ mod tests {
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -6739,6 +6812,8 @@ mod tests {
             equity_hard_stop_loss: hs,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -6830,6 +6905,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -6887,6 +6964,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -6944,6 +7023,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7014,6 +7095,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7082,6 +7165,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7175,6 +7260,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7273,6 +7360,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7348,6 +7437,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7457,6 +7548,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7536,6 +7629,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7617,6 +7712,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 24 * 60,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7703,6 +7800,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7793,6 +7892,8 @@ mod tests {
             market_order_slippage_pct: 0.0005,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7857,6 +7958,8 @@ mod tests {
             forager_score_hysteresis_pct: 0.0,
             candle_interval_minutes: 1,
             allow_liquidation_reset: false,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
         };
 
         let mut bt = Backtest::new(
@@ -7968,6 +8071,100 @@ mod tests {
                 < 1e-12,
             "hourly volatility alpha should not change with interval"
         );
+    }
+
+    #[test]
+    fn liquidation_reset_records_held_positions() {
+        let hlcvs = Array3::from_shape_vec((8, 2, 4), vec![1.0; 8 * 2 * 4]).unwrap();
+        let btc_usd_prices = Array1::from_vec(vec![20_000.0; 8]);
+
+        let mut bp_pair = BotParamsPair::default();
+        bp_pair.long.n_positions = 2;
+        bp_pair.long.ema_span_0 = 1.0;
+        bp_pair.long.ema_span_1 = 1.0;
+
+        let backtest_params = BacktestParams {
+            starting_balance: 1000.0,
+            maker_fee: 0.0,
+            taker_fee: 0.00055,
+            coins: vec!["ETH".to_string(), "BTC".to_string()],
+            active_coin_indices: None,
+            first_timestamp_ms: 0,
+            requested_start_timestamp_ms: 0,
+            first_valid_indices: vec![0, 0],
+            last_valid_indices: vec![7, 7],
+            warmup_minutes: vec![0, 0],
+            trade_start_indices: vec![0, 0],
+            global_warmup_bars: 0,
+            btc_collateral_cap: 0.0,
+            btc_collateral_ltv_cap: None,
+            metrics_only: true,
+            filter_by_min_effective_cost: false,
+            dynamic_wel_by_tradability: true,
+            hedge_mode: true,
+            forager_score_hysteresis_pct: 0.0,
+            max_realized_loss_pct: 1.0,
+            pnls_max_lookback_days: 30.0,
+            liquidation_threshold: 0.05,
+            allow_liquidation_reset: true,
+            equity_hard_stop_loss: EquityHardStopLossConfig::default(),
+            market_orders_allowed: false,
+            market_order_near_touch_threshold: 0.001,
+            market_order_slippage_pct: 0.0005,
+            candle_interval_minutes: 1,
+            day_drop_twe_threshold_pct: 0.0,
+            day_drop_twe_multiplier: 0.0,
+        };
+
+        let mut bt = Backtest::new(
+            hlcvs.view(),
+            btc_usd_prices.view(),
+            vec![bp_pair.clone(), bp_pair],
+            vec![ExchangeParams::default(), ExchangeParams::default()],
+            &backtest_params,
+        );
+        bt.positions.long.insert(
+            0,
+            Position {
+                size: 2.0,
+                price: 100.0,
+            },
+        );
+        bt.positions.long.insert(
+            1,
+            Position {
+                size: 0.0,
+                price: 50.0,
+            },
+        );
+        bt.positions.short.insert(
+            1,
+            Position {
+                size: -1.5,
+                price: 50.0,
+            },
+        );
+
+        bt.reset_after_liquidation(5);
+
+        let events = bt.liquidation_events();
+        assert_eq!(events.len(), 1);
+        let event = &events[0];
+        // 1m candles from ts 0: candle 5 closes at 300_000 ms, NaN marker at +1 ms
+        assert_eq!(event.timestamp_ms, 300_001);
+        // zero-size entries are dropped; remaining sorted by coin then pside
+        assert_eq!(event.positions.len(), 2);
+        assert_eq!(event.positions[0].coin, "BTC");
+        assert_eq!(event.positions[0].pside, "short");
+        assert!((event.positions[0].size - 1.5).abs() < 1e-12);
+        assert!((event.positions[0].price - 50.0).abs() < 1e-12);
+        assert_eq!(event.positions[1].coin, "ETH");
+        assert_eq!(event.positions[1].pside, "long");
+        assert!((event.positions[1].size - 2.0).abs() < 1e-12);
+
+        assert_eq!(bt.n_liquidations(), 1);
+        assert!(bt.positions.long.is_empty());
+        assert!(bt.positions.short.is_empty());
     }
 }
 

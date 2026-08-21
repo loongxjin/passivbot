@@ -742,6 +742,19 @@ def plot_fills_forager(
     return plt
 
 
+def format_liquidation_positions(held_positions) -> str:
+    """
+    Format held positions for the liquidation annotation, e.g. "BTC[L] ETH[S]".
+
+    held_positions is a list of (coin, pside, size, price) tuples; empty/None -> "".
+    """
+    parts = []
+    for coin, pside, _size, _price in held_positions or []:
+        marker = "L" if str(pside).lower().startswith("l") else "S"
+        parts.append(f"{coin}[{marker}]")
+    return " ".join(parts)
+
+
 def create_forager_balance_figures(
     bal_eq: pd.DataFrame,
     figsize=(21, 13),
@@ -812,10 +825,16 @@ def create_forager_balance_figures(
 
         # Auto-detect liquidation timestamps from NaN markers or use provided info
         liq_ts = None
-        liq_balances = None
+        liq_details = None
         if liquidation_info:
-            liq_ts = [ts for ts, _ in liquidation_info]
-            liq_balances = {ts: bal for ts, bal in liquidation_info}
+            liq_ts = [entry[0] for entry in liquidation_info]
+            liq_details = {
+                entry[0]: (
+                    entry[1],
+                    entry[2] if len(entry) > 2 else [],
+                )
+                for entry in liquidation_info
+            }
         elif 'usd_total_equity' in df.columns:
             eq = pd.to_numeric(df['usd_total_equity'], errors='coerce')
             nan_mask = eq.isna()
@@ -855,9 +874,13 @@ def create_forager_balance_figures(
                         ts_str = str(ts)
                 else:
                     ts_str = str(ts)
-                if liq_balances and ts in liq_balances:
-                    peak = liq_balances[ts]
-                    lines.append(f"Liq #{i}: {ts_str} | peak {peak:,.0f}")
+                if liq_details and ts in liq_details:
+                    peak, held = liq_details[ts]
+                    line = f"Liq #{i}: {ts_str} | peak {peak:,.0f}"
+                    pos_str = format_liquidation_positions(held)
+                    if pos_str:
+                        line += f" | pos: {pos_str}"
+                    lines.append(line)
                 else:
                     lines.append(f"Liq #{i}: {ts_str}")
             if lines:

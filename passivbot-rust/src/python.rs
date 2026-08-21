@@ -31,7 +31,14 @@ use serde::Serialize;
 use serde_json;
 use std::str::FromStr;
 
-type BacktestPyResult = (PyObject, PyObject, Py<PyDict>, Py<PyDict>, PyObject);
+type BacktestPyResult = (
+    PyObject,
+    PyObject,
+    Py<PyDict>,
+    Py<PyDict>,
+    PyObject,
+    PyObject,
+);
 
 #[pyclass(name = "HlcvsBundle", module = "passivbot_rust", unsendable)]
 pub struct HlcvsBundlePy {
@@ -1140,6 +1147,7 @@ fn run_backtest_core<'py>(
                 py_analysis_usd,
                 py_analysis_btc,
                 py.None().into_py(py),
+                PyList::empty_bound(py).into_py(py),
             ));
         }
         let hard_stop_plot_data = backtest.hard_stop_plot_data();
@@ -1225,12 +1233,29 @@ fn run_backtest_core<'py>(
             .into_pyarray_bound(py)
             .unbind();
         let fills_array = py_fills.into_pyarray_bound(py).unbind();
+        let py_liquidation_events = PyList::empty_bound(py);
+        for event in backtest.liquidation_events() {
+            let py_event = PyDict::new_bound(py);
+            py_event.set_item("timestamp_ms", event.timestamp_ms)?;
+            let py_positions = PyList::empty_bound(py);
+            for pos in &event.positions {
+                let py_pos = PyDict::new_bound(py);
+                py_pos.set_item("coin", pos.coin.clone())?;
+                py_pos.set_item("pside", pos.pside.clone())?;
+                py_pos.set_item("size", pos.size)?;
+                py_pos.set_item("price", pos.price)?;
+                py_positions.append(py_pos)?;
+            }
+            py_event.set_item("positions", py_positions)?;
+            py_liquidation_events.append(py_event)?;
+        }
         Ok((
             fills_array.into_py(py),
             equities_array.into_py(py),
             py_analysis_usd,
             py_analysis_btc,
             py_hard_stop_plot.into_py(py),
+            py_liquidation_events.into_py(py),
         ))
     })
 }

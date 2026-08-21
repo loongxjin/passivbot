@@ -566,6 +566,27 @@ pub struct Equities {
     pub btc_total_equity: Vec<f64>,
 }
 
+/// A single position held at the moment of a liquidation reset.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiquidationPosition {
+    pub coin: String,
+    /// "long" or "short"
+    pub pside: String,
+    /// abs position size
+    pub size: f64,
+    /// position entry price
+    pub price: f64,
+}
+
+/// Snapshot of open positions captured immediately before a liquidation reset.
+#[derive(Debug, Clone, Serialize)]
+pub struct LiquidationEvent {
+    /// Matches the NaN marker timestamp pushed to the equities stream (candle ts + 1 ms).
+    pub timestamp_ms: u64,
+    /// Held positions sorted by coin name, then pside (long before short).
+    pub positions: Vec<LiquidationPosition>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Fill {
     pub index: usize,
