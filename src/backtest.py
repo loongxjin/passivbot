@@ -158,7 +158,6 @@ class BacktestPlotContext:
     hlcvs: np.ndarray | None = None
     timestamps: np.ndarray | None = None
     hard_stop_plot_data: Any = None
-    liquidation_events: Any = None
 
     @classmethod
     def from_payload(cls, payload) -> "BacktestPlotContext":
@@ -166,7 +165,6 @@ class BacktestPlotContext:
             hlcvs=np.asarray(payload.bundle.hlcvs),
             timestamps=np.asarray(payload.bundle.timestamps),
             hard_stop_plot_data=payload.hard_stop_plot_data,
-            liquidation_events=getattr(payload, "liquidation_events", None),
         )
 
 
@@ -479,7 +477,6 @@ class BacktestPayload:
     backtest_params: dict
     execution_settings: BacktestExecutionSettings | None = None
     hard_stop_plot_data: dict | None = None
-    liquidation_events: list | None = None
 
 
 def build_backtest_payload(
@@ -735,16 +732,7 @@ def execute_backtest(payload: BacktestPayload, config: dict):
         payload.exchange_params,
         payload.backtest_params,
     )
-    if len(backtest_result) == 6:
-        (
-            fills,
-            equities_array,
-            analysis_usd,
-            analysis_btc,
-            hard_stop_plot_data,
-            liquidation_events,
-        ) = backtest_result
-    elif len(backtest_result) == 5:
+    if len(backtest_result) == 5:
         (
             fills,
             equities_array,
@@ -752,25 +740,21 @@ def execute_backtest(payload: BacktestPayload, config: dict):
             analysis_btc,
             hard_stop_plot_data,
         ) = backtest_result
-        liquidation_events = []
     elif len(backtest_result) == 4:
         fills, equities_array, analysis_usd, analysis_btc = backtest_result
         hard_stop_plot_data = {}
-        liquidation_events = []
     else:
         raise ValueError(
-            f"run_backtest_bundle returned {len(backtest_result)} values; expected 4, 5 or 6"
+            f"run_backtest_bundle returned {len(backtest_result)} values; expected 4 or 5"
         )
 
     if payload.backtest_params.get("metrics_only", False):
         payload.hard_stop_plot_data = {}
-        payload.liquidation_events = []
         analysis = expand_analysis(analysis_usd, analysis_btc, None, equities_array, config)
         return None, None, analysis
 
     equities_array = np.asarray(equities_array)
     payload.hard_stop_plot_data = dict(hard_stop_plot_data or {})
-    payload.liquidation_events = list(liquidation_events or [])
     analysis = expand_analysis(
         analysis_usd, analysis_btc, fills, equities_array, config
     )
@@ -2225,64 +2209,6 @@ def run_backtest(
     return fills, equities_array, analysis
 
 
-def compute_liquidation_info(equities_array, bal_eq, liquidation_events=None):
-    """
-    Derive per-liquidation annotation info from NaN markers in the raw equities array.
-
-    Returns a list of (timestamp, peak_balance, held_positions) tuples, merged by
-    calendar day, where held_positions is a list of (coin, pside, size, price) tuples
-    captured by the Rust engine at the moment of each liquidation reset (empty when
-    no matching event is available), or None when no liquidation markers exist.
-    """
-    from itertools import groupby
-
-    equities_array = np.asarray(equities_array)
-    events_by_ts = {}
-    for event in liquidation_events or []:
-        try:
-            timestamp_ms = int(event["timestamp_ms"])
-        except (KeyError, TypeError, ValueError) as e:
-            raise ValueError(
-                f"invalid liquidation event from backtest engine: {event!r}"
-            ) from e
-        events_by_ts[timestamp_ms] = event.get("positions") or []
-    if equities_array.size == 0 or equities_array.shape[1] < 2:
-        return None
-    nan_mask = np.isnan(equities_array[:, 1])
-    if not nan_mask.any():
-        return None
-    raw_ts = equities_array[nan_mask, 0].astype(np.int64)
-    liq_dts = pd.to_datetime(raw_ts, unit="ms")
-    bal_series = bal_eq["usd_total_balance"]
-    # Group consecutive liquidations by calendar day, take max peak per day
-    raw_info = []
-    prev_ts = bal_eq.index[0]
-    for raw_ms, liq_ts in zip(raw_ts, liq_dts):
-        mask = (bal_eq.index >= prev_ts) & (bal_eq.index <= liq_ts)
-        segment = bal_series.loc[mask]
-        peak = float(segment.max()) if len(segment) > 0 and not segment.isna().all() else 0.0
-        held = [
-            (str(p["coin"]), str(p["pside"]), float(p["size"]), float(p["price"]))
-            for p in events_by_ts.get(int(raw_ms), [])
-        ]
-        raw_info.append((liq_ts, peak, held))
-        prev_ts = liq_ts
-    # Merge same-day entries: max peak, last timestamp, union of held coins
-    merged = []
-    for _, group in groupby(raw_info, key=lambda x: x[0].date()):
-        group_list = list(group)
-        best_peak = max(p for _, p, _ in group_list)
-        ts = group_list[-1][0]  # last timestamp of the day
-        coins = {}
-        for _, _, held in group_list:
-            for coin, pside, size, price in held:
-                key = (coin, pside)
-                if key not in coins or size > coins[key][2]:
-                    coins[key] = (coin, pside, size, price)
-        merged.append((ts, best_peak, sorted(coins.values())))
-    return merged
-
-
 def post_process(
     config,
     hlcvs,
@@ -2360,13 +2286,33 @@ def post_process(
     dump_backtest_dataset_metadata(config, exchange, results_path)
     fdf.to_csv(f"{results_path}fills.csv")
     bal_eq.to_csv(oj(results_path, "balance_and_equity.csv.gz"), compression="gzip")
-    # Compute liquidation info: peak balance per "life", merged by calendar day,
-    # with the coins held at each liquidation (from Rust engine events)
-    liquidation_info = compute_liquidation_info(
-        equities_array,
-        bal_eq,
-        plot_context.liquidation_events if plot_context else None,
-    )
+    # Compute liquidation info: peak balance per "life", merged by calendar day
+    liquidation_info = None
+    if equities_array.size > 0 and equities_array.shape[1] >= 2:
+        eq_col = equities_array[:, 1]
+        nan_mask = np.isnan(eq_col)
+        if nan_mask.any():
+            raw_ts = equities_array[nan_mask, 0].astype(np.int64)
+            liq_dts = pd.to_datetime(raw_ts, unit="ms")
+            bal_series = bal_eq["usd_total_balance"]
+            # Group consecutive liquidations by calendar day, take max peak per day
+            from itertools import groupby
+            raw_info = []
+            prev_ts = bal_eq.index[0]
+            for liq_ts in liq_dts:
+                mask = (bal_eq.index >= prev_ts) & (bal_eq.index <= liq_ts)
+                segment = bal_series.loc[mask]
+                peak = float(segment.max()) if len(segment) > 0 and not segment.isna().all() else 0.0
+                raw_info.append((liq_ts, peak, prev_ts))
+                prev_ts = liq_ts
+            # Merge same-day entries
+            merged = []
+            for _, group in groupby(raw_info, key=lambda x: x[0].date()):
+                group_list = list(group)
+                best_peak = max(p for _, p, _ in group_list)
+                ts = group_list[-1][0]  # last timestamp of the day
+                merged.append((ts, best_peak))
+            liquidation_info = merged
     if "balance" not in disabled_plot_groups:
         balance_figs = create_forager_balance_figures(
             bal_eq,
