@@ -180,6 +180,18 @@ except Exception:
     echo ""
 }
 
+find_services_using_config() {
+    local config_rel="$1"
+    for service_file in "$SYSTEMD_DIR"/passivbot*.service; do
+        [ -f "$service_file" ] || continue
+        local svc_name=$(basename "$service_file" .service)
+        local used_cfg=$(grep "ExecStart=" "$service_file" 2>/dev/null | grep -oE 'configs/[^[:space:]]+\.json' || true)
+        if [ "$used_cfg" = "$config_rel" ]; then
+            echo "$svc_name"
+        fi
+    done
+}
+
 find_log_file() {
     local user="$1"
     local log_dir="$PASSIVBOT_DIR/logs"
@@ -429,6 +441,17 @@ create_bot() {
         config_file=$(resolve_config_path "$config_input")
         config_rel=$(get_config_relative "$config_file")
         [ ! -f "$config_file" ] && { echo -e "${RED}配置文件仍不存在${NC}"; return 1; }
+    fi
+
+    # 检查配置是否已被其他机器人引用
+    local shared_services=$(find_services_using_config "$config_rel")
+    if [ -n "$shared_services" ]; then
+        echo ""
+        echo -e "${YELLOW}警告: 配置 $config_rel 已被以下服务引用:${NC}"
+        while IFS= read -r svc; do
+            [ -n "$svc" ] && echo -e "  ${YELLOW}- $svc${NC}"
+        done <<< "$shared_services"
+        echo -e "${YELLOW}共用同一配置时，leverage/panic/unpanic 的改动会波及所有引用的机器人; 建议使用独立配置副本${NC}"
     fi
 
     # 交互选择 api-key
