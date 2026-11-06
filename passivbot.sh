@@ -157,14 +157,15 @@ get_api_key_from_service() {
         echo ""
         return 1
     fi
-    # 尝试从新版 CLI -u 参数提取
-    local api_key=$(grep -oP 'live -u \K[^ ]+' "$service_file" 2>/dev/null || true)
+    # 尝试从新版 CLI -u 参数提取 (-u 可位于 ExecStart 任意位置: live <config> -u <user> ...)
+    local api_key=$(grep "ExecStart=" "$service_file" 2>/dev/null | head -1 | \
+        awk '{for (i = 1; i <= NF; i++) if ($i == "-u" && i < NF) {print $(i + 1); exit}}')
     if [ -n "$api_key" ]; then
         echo "$api_key"
         return 0
     fi
     # 尝试从旧版 config 文件提取 live.user
-    local config=$(grep "ExecStart=" "$service_file" 2>/dev/null | grep -oP 'configs/[^[:space:]]+\.json' || echo "")
+    local config=$(grep "ExecStart=" "$service_file" 2>/dev/null | grep -oE 'configs/[^[:space:]]+\.json' || echo "")
     if [ -n "$config" ] && [ -f "$PASSIVBOT_DIR/$config" ]; then
         python3 -c "
 import json
