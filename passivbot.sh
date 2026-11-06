@@ -941,16 +941,20 @@ print('配置修改成功')
     echo -e "${GREEN}配置已修改${NC}"
     echo ""
 
-    # 自动重启服务使配置生效
-    echo "重启服务使配置生效..."
-    sudo systemctl restart "$service_name"
-    sleep 3
-
+    # 自动重启服务使配置生效 (仅当服务在运行; 已真停止的机器人不被拉起)
     if systemctl is-active --quiet "$service_name" 2>/dev/null; then
-        echo -e "${GREEN}服务已重启，新杠杆已生效！${NC}"
+        echo "重启服务使配置生效..."
+        sudo systemctl restart "$service_name"
+        sleep 3
+
+        if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+            echo -e "${GREEN}服务已重启，新杠杆已生效！${NC}"
+        else
+            echo -e "${RED}服务启动失败，请检查日志${NC}"
+            echo "查看日志: $0 logs $1"
+        fi
     else
-        echo -e "${RED}服务启动失败，请检查日志${NC}"
-        echo "查看日志: $0 logs $1"
+        echo -e "${YELLOW}服务未运行，配置已修改，下次启动时生效 ($0 start $1)${NC}"
     fi
 }
 
@@ -1239,15 +1243,19 @@ unpanic_single() {
     cp "$backup_file" "$config_file"
     echo -e "${GREEN}配置已恢复${NC}"
 
-    # 重启服务
-    echo "重启服务..."
-    sudo systemctl restart "$service_name"
-    sleep 3
-
+    # 重启服务 (仅当服务在运行; 已真停止的机器人不被拉起)
     if systemctl is-active --quiet "$service_name" 2>/dev/null; then
-        echo -e "${GREEN}服务已重启，恢复正常模式${NC}"
+        echo "重启服务..."
+        sudo systemctl restart "$service_name"
+        sleep 3
+
+        if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+            echo -e "${GREEN}服务已重启，恢复正常模式${NC}"
+        else
+            echo -e "${RED}服务启动失败，请检查日志${NC}"
+        fi
     else
-        echo -e "${RED}服务启动失败，请检查日志${NC}"
+        echo -e "${YELLOW}服务未运行，配置已恢复，下次启动时生效${NC}"
     fi
 }
 
@@ -1277,7 +1285,9 @@ unpanic_all() {
 
         echo -e "恢复 ${CYAN}$svc_name${NC} <- $backup_file"
         cp "$backup_file" "$config_file"
-        sudo systemctl restart "$svc_name" 2>/dev/null
+        if systemctl is-active --quiet "$svc_name" 2>/dev/null; then
+            sudo systemctl restart "$svc_name" 2>/dev/null
+        fi
         count=$((count + 1))
     done
 
