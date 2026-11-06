@@ -8,6 +8,7 @@
 #   ./passivbot.sh list                               # 列出所有机器人
 #   ./passivbot.sh status [服务名]                    # 查看状态
 #   ./passivbot.sh start|stop|restart <服务名>        # 控制服务
+#   ./passivbot.sh halt <服务名>                      # 真停: 停止并取消开机自启
 #   ./passivbot.sh start-all|stop-all                  # 启动/停止所有机器人
 #   ./passivbot.sh delete <服务名>                     # 删除机器人实例
 #   ./passivbot.sh delete-all                           # 删除所有机器人实例
@@ -70,6 +71,11 @@ show_help() {
     echo ""
     echo -e "  ${RED}stop-all${NC}"
     echo "      停止所有机器人"
+    echo ""
+    echo -e "  ${RED}halt${NC} <服务名>"
+    echo "      真停: 停止进程并取消开机自启 (重启服务器后不会自动启动)"
+    echo "      临时启动一次: $0 start <服务名>"
+    echo "      恢复开机自启: sudo systemctl enable passivbot-<服务名>"
     echo ""
     echo -e "  ${GREEN}restart${NC} <服务名>"
     echo "      重启指定机器人"
@@ -724,6 +730,55 @@ control_service() {
     else
         echo -e "状态: ${RED}停止${NC}"
     fi
+}
+
+halt_service() {
+    local service_name=$(get_service_name "$1")
+
+    echo "========================================"
+    echo "真停机器人 (停止进程 + 取消开机自启)"
+    echo "========================================"
+    echo ""
+
+    if [ -z "$service_name" ]; then
+        echo -e "${RED}错误: 请指定服务名${NC}"
+        echo "用法: $0 halt <服务名>"
+        return 1
+    fi
+
+    if [ ! -f "$SYSTEMD_DIR/$service_name.service" ]; then
+        echo -e "${RED}错误: 服务 '$service_name' 不存在${NC}"
+        return 1
+    fi
+
+    echo -e "服务: ${CYAN}$service_name${NC}"
+    echo ""
+
+    echo "停止进程..."
+    sudo systemctl stop "$service_name" 2>/dev/null || true
+
+    echo "取消开机自启..."
+    sudo systemctl disable "$service_name" 2>/dev/null || true
+
+    echo ""
+    local failed=0
+    if systemctl is-active --quiet "$service_name" 2>/dev/null; then
+        echo -e "状态: ${RED}仍在运行 (停止失败，请检查: systemctl status $service_name)${NC}"
+        failed=1
+    fi
+    if systemctl is-enabled --quiet "$service_name" 2>/dev/null; then
+        echo -e "状态: ${RED}进程已停止，但仍为开机自启 (disable 失败，请检查)${NC}"
+        failed=1
+    fi
+    if [ $failed -ne 0 ]; then
+        return 1
+    fi
+
+    echo -e "状态: ${GREEN}已真停 (进程停止 + 开机不自启，重启服务器后不会自动启动)${NC}"
+    echo ""
+    echo "恢复方法:"
+    echo "  临时启动一次: $0 start $1"
+    echo "  恢复开机自启: sudo systemctl enable $service_name"
 }
 
 run_config_check() {
@@ -1426,6 +1481,10 @@ main() {
         stop)
             shift
             control_service "stop" "$1"
+            ;;
+        halt)
+            shift
+            halt_service "$1"
             ;;
         stop-all|sa)
             stop_all
